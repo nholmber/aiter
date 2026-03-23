@@ -1167,6 +1167,8 @@ namespace py = pybind11;
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
           py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts")         = 0,                           \
+          py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("topk_softmax_asm",                                                  \
           &topk_softmax_asm,                                                   \
@@ -1266,7 +1268,7 @@ namespace py = pybind11;
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
     m.def("fmoe_int8_g1u0_a16",                                                \
-          &fmoe_int8_g1u0_a16,                                                \
+          &fmoe_int8_g1u0_a16,                                                 \
           py::arg("out"),                                                      \
           py::arg("input"),                                                    \
           py::arg("gate"),                                                     \
@@ -1280,7 +1282,7 @@ namespace py = pybind11;
           py::arg("fc2_scale"),                                                \
           py::arg("fc1_smooth_scale"),                                         \
           py::arg("fc2_smooth_scale"),                                         \
-          py::arg("activation") = ActivationType::Silu);                      \
+          py::arg("activation") = ActivationType::Silu);                       \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
