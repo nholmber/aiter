@@ -15,7 +15,7 @@
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
 using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
@@ -94,11 +94,11 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
     }
     else
     {
