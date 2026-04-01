@@ -20,7 +20,7 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
-BLOCK_SIZE_M = 32
+BLOCK_SIZE_M = int(os.environ.get("AITER_BLOCK_SIZE_M", "32")) # 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 
@@ -36,6 +36,7 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    moe_buf=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -48,7 +49,8 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    if moe_buf is None:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -78,6 +80,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    moe_buf=None,
 ):
     try:
         return _moe_sorting_impl(
@@ -91,6 +94,7 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
+            moe_buf=moe_buf,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -142,6 +146,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    moe_buf=None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -167,6 +172,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        moe_buf=moe_buf,
     )
 
 
@@ -194,7 +200,10 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    moe_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if moe_buf is not None:
+        return moe_buf
     device = topk_ids.device
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
@@ -228,6 +237,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    moe_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -306,6 +316,7 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        moe_buf=moe_buf,
     )
 
     if metadata.run_1stage:
@@ -776,6 +787,9 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
+        if False:
+            return False
+        return True # always use cfg
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
         bypass_type = (
             ActivationType.Silu,
@@ -823,7 +837,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
-        run_1stage_xbf16 = False
+        run_1stage_xbf16 = os.environ.get("AITER_RUN_1STAGE_XBF16", "0") == "1" # False
         if (
             activation,
             q_type,
@@ -843,7 +857,10 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
+        run_1stage = os.environ.get("AITER_RUN_1STAGE", "0") == "1" #True
         run_1stage = run_1stage or run_1stage_xbf16
+        # print os.environ all flags
+        print(os.environ)
 
         block_m = (
             BLOCK_SIZE_M
@@ -870,8 +887,8 @@ def get_2stage_cfgs(
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
-        kernelName1 = cfg["kernelName1"]
-        kernelName2 = cfg["kernelName2"]
+        kernelName1 = cfg["kernelName1"] if isinstance(cfg.get("kernelName1"), str) else ""
+        kernelName2 = cfg["kernelName2"] if isinstance(cfg.get("kernelName2"), str) else ""
         run_1stage = cfg.get("run_1stage", False)
         run_1stage_xbf16 = run_1stage and "blockscaleBf16" in kernelName1
 
