@@ -65,7 +65,7 @@ def _moe_sorting_impl(
         int(block_size),
         expert_mask,
         num_local_tokens,
-        dispatch_policy,
+        2, # force dispatch_policy=2
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
