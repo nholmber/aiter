@@ -229,17 +229,46 @@ parser.add_argument(
         or --ck_preshuffle False
     """,
 )
+parser.add_argument(
+    "-mnk",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=None,
+    help="""Explicit M,N,K tuples. Overrides -m and -nk.
+    e.g. -mnk 1,256,2048 32,512,7168""",
+)
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="""Path to CSV with M,N,K columns (first 3 cols, header row skipped).
+    Overrides -m, -nk, and -mnk.""",
+)
 
 args = parser.parse_args()
 
+if args.csv:
+    import csv as csvmod
+    shapes = []
+    with open(args.csv) as cf:
+        reader = csvmod.reader(cf)
+        next(reader)
+        for row in reader:
+            shapes.append((int(row[0].strip()), int(row[1].strip()), int(row[2].strip())))
+    print(f"Loaded {len(shapes)} shapes from {args.csv}")
+elif args.mnk:
+    shapes = [(int(t[0]), int(t[1]), int(t[2])) for t in args.mnk]
+    print(f"Using {len(shapes)} explicit -mnk shapes")
+else:
+    shapes = [(m, n, k) for m in args.m for n, k in args.nk]
+    print(f"Using {len(shapes)} shapes from -m x -nk cross-product")
+
 df = []
 for dtype in args.dtype:
-    # deepseek-r1
-    for m in args.m:
-        for n, k in args.nk:
-            for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
-                df.append(ret)
+    for m, n, k in shapes:
+        for ck_p in args.ck_preshuffle:
+            ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+            df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation
