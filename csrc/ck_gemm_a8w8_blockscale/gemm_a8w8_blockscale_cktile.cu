@@ -14,7 +14,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -101,17 +101,16 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
     int M = XQ.size(0);
     int N = WQ.size(0);
     int K = XQ.size(1);
-    int KBatch = static_cast<int>(std::pow(2, splitK));
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
         blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
         blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else
     {
@@ -127,5 +126,5 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile(torch::Tensor& XQ,
                                                       torch::Tensor& Y,
                                                       bool preshuffleB)
 {
-    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, 0);
+    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
 }
