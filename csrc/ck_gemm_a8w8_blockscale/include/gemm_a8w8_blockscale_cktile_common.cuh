@@ -130,7 +130,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         GemmConfig::K_Warp_Tile_v == 128;
     // When AQRowMajor is true for an 8-warp config, the kernel reads x_scale
     // in row-major layout natively, avoiding the host-side transpose.
-    static constexpr bool aq_col_major = eight_waves && !GemmConfig::AQRowMajor_v;
+    static constexpr bool aq_col_major = eight_warps && !GemmConfig::AQRowMajor_v;
 
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
