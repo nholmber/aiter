@@ -229,17 +229,39 @@ parser.add_argument(
         or --ck_preshuffle False
     """,
 )
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="""CSV file with M,N,K columns specifying explicit shapes to benchmark.
+    When provided, -m and -nk arguments are ignored.
+    e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "-mnk",
+    type=str,
+    nargs="*",
+    default=None,
+    help="""Explicit M,N,K triplets.
+    e.g.: -mnk 1,24576,1536 32,7168,2304""",
+)
 
 args = parser.parse_args()
 
+if args.csv:
+    csv_df = pd.read_csv(args.csv)
+    mnk_list = list(zip(csv_df["M"], csv_df["N"], csv_df["K"]))
+elif args.mnk:
+    mnk_list = [tuple(int(x) for x in s.split(",")) for s in args.mnk]
+else:
+    mnk_list = [(m, n, k) for m in args.m for n, k in args.nk]
+
 df = []
 for dtype in args.dtype:
-    # deepseek-r1
-    for m in args.m:
-        for n, k in args.nk:
-            for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
-                df.append(ret)
+    for m, n, k in mnk_list:
+        for ck_p in args.ck_preshuffle:
+            ret = test_gemm(dtype, int(m), int(n), int(k), ck_preshuffle=ck_p)
+            df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation
