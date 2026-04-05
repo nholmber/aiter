@@ -260,8 +260,14 @@ df = []
 for dtype in args.dtype:
     for m, n, k in mnk_list:
         for ck_p in args.ck_preshuffle:
-            ret = test_gemm(dtype, int(m), int(n), int(k), ck_preshuffle=ck_p)
-            df.append(ret)
+            try:
+                ret = test_gemm(dtype, int(m), int(n), int(k), ck_preshuffle=ck_p)
+                df.append(ret)
+            except RuntimeError as e:
+                print(f"[SKIP] m={m}, n={n}, k={k}, ck_preshuffle={ck_p}: {e}")
+                df.append({"dtype": dtype, "M": int(m), "N": int(n), "K": int(k),
+                           "ck_preshuffle": ck_p, "tflops": 0, "bw": 0,
+                           "avg_us": float("nan"), "err": 1})
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation
