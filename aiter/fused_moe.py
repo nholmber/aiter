@@ -434,7 +434,7 @@ def fused_moe_1stage(
     else:
         if xbf16:
             a1 = hidden_states
-            a1_scale = torch.empty(0)
+            a1_scale = torch.empty(0, device=hidden_states.device)
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
