@@ -829,17 +829,6 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
-        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        bypass_type = (
-            ActivationType.Silu,
-            dtypes.bf16,
-            dtypes.fp8,
-            dtypes.fp8,
-            QuantType.per_1x128,
-        )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
         return True
 
     # cfg = cfg_2stages.get(keys, None)
