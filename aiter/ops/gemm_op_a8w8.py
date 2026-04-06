@@ -166,7 +166,6 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -620,7 +619,7 @@ def gemm_a8w8_blockscale(
             splitK = int(config.get("splitK", 0))
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
-                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                    XQ, WQ, x_scale, w_scale, Y
                 )
             elif libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
