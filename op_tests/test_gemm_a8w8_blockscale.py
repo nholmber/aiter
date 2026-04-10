@@ -358,3 +358,8 @@ if args.output:
     out_path = os.path.join(args.output, csv_filename)
     df.to_csv(out_path, index=False)
     print(f"Saved results to: {out_path}")
+
+# Correctness check: verify split-K produces matching results
+print("\nRunning split-K correctness checks ...")
+for splitK in [1, 2]:
+    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
