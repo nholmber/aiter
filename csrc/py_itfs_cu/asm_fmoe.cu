@@ -76,21 +76,30 @@ class FMoeKernel
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
     const char* name            = nullptr;
+    // Set from the kernel manifest's "fused" column (defaults to 0 when the
+    // column is absent). When set, the kernel subsumes moe_sort + per-token
+    // quant + both GEMM stages; the host bypasses moe_sorting and feeds raw
+    // topk_ids/topk_weights, and the launcher uses a 3D dispatch with
+    // gdy = topk and gdz = token_cnt so each TG sees (token, slot) directly.
+    bool is_fused = false;
 
     public:
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
-               uint32_t num_persistent_tgs = 0) : kernel(name, hsaco)
+               uint32_t num_persistent_tgs = 0,
+               bool is_fused               = false) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
+        this->is_fused           = is_fused;
     };
 
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
+    bool get_is_fused() const { return is_fused; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -182,8 +191,23 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
-           (args.total_tgs % args.ps_deno) == 0) // ps
+        // Fully fused (e.g. FLAT) variant: kernel ingests raw
+        // topk_ids/topk_weights through the sorted_ids/sorted_weights kernarg
+        // slots and does its own per-token quant; sub_X_cnt is unused. 3D
+        // dispatch: gdy = topk (slot), gdz = M (token_id). Each TG sees
+        // s_tg_idy == slot and s_tg_idz == token_id directly, so it skips
+        // int_div_ss(s_tg_idy, topk) and reads (eid, weight) at index
+        // s_tg_idz*topk + s_tg_idy directly. The flag is plumbed from the
+        // manifest CSV "fused" column (see FMoeKernel ctor).
+        if(this->is_fused)
+        {
+            bdx = 256;
+            gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+            gdy = static_cast<int>(topk);
+            gdz = static_cast<int>(token_cnt);
+        }
+        else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
+                (args.total_tgs % args.ps_deno) == 0) // ps
         {
 
             bdx = 256;
@@ -297,8 +321,10 @@ FMoeKernel* get_heuristic_kernel(
         else
             num_persistent_tgs = 0;
 
-        impl_ptr = &impl_ptr_map.get_or_create(
-            name, [&]() { return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs); });
+        const bool is_fused = (cfg.fused != 0);
+        impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
+            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, is_fused);
+        });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + selectedKl);
