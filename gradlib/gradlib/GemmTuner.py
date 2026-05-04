@@ -29,6 +29,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -90,6 +91,44 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+@lru_cache(maxsize=1)
+def get_native_gemm_funcs():
+    from aiter.tuned_gemm import is_skinny_default_shape, skinny_gemm, torch_gemm
+
+    return torch_gemm, skinny_gemm, is_skinny_default_shape
+
+
+def run_torch_gemm_a16w16(
+    input,
+    weight,
+    bias=None,
+    scale_a=None,
+    scale_b=None,
+    otype=dtypes.bf16,
+):
+    native_torch_gemm, _, _ = get_native_gemm_funcs()
+    return native_torch_gemm(
+        input,
+        weight,
+        0,
+        bias=bias,
+        otype=otype,
+        scale_a=scale_a,
+        scale_b=scale_b,
+    )
+
+
+def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
+    _, native_skinny_gemm, _ = get_native_gemm_funcs()
+    return native_skinny_gemm(
+        input,
+        weight,
+        2,
+        bias=bias,
+        otype=otype,
+    )
 
 
 def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
@@ -468,6 +507,13 @@ class Gemm:
                 )
                 if self.k / splitK < subK:
                     break
+                # splitK kernels use a semaphore array of size gdx*gdy; skip
+                # candidates where the grid exceeds the semaphore workspace limit.
+                if splitK > 1:
+                    gdx = (self.n + tile_n - 1) // tile_n
+                    gdy = (self.m + tile_m - 1) // tile_m
+                    if gdx * gdy > ASM_SPLITK_MAX_GRID:
+                        continue
                 task_asm.append(
                     (
                         info,
@@ -506,6 +552,10 @@ class Gemm:
         tasks = []
         if "all" in self.libtype or "flydsl" in self.libtype:
             tasks.extend(self.flydsl_gemm_all_sols())
+        if "all" in self.libtype or "skinny" in self.libtype:
+            tasks.extend(self.skinny_gemm_all_sols())
+        if "all" in self.libtype or "torch" in self.libtype:
+            tasks.extend(self.torch_gemm_all_sols())
         if "all" in self.libtype or "triton" in self.libtype:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
@@ -537,8 +587,11 @@ class Gemm:
         task = []
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
         weight_idx = 6 if self.is_shuffle else 1
+        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
+                continue
+            if config["tile_m"] > max(self.m, min_tile_m):
                 continue
             if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
                 continue
@@ -603,6 +656,127 @@ class Gemm:
             "FlyDSL candidate count for "
             f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}, "
             f"bpreshuffle={self.is_shuffle}: {len(task)}"
+        )
+        return task
+
+    def skinny_gemm_all_sols(self):
+        _, _, native_is_skinny_default_shape = get_native_gemm_funcs()
+        if self.is_shuffle:
+            logger.warning(
+                f"Skinny gemm does not support weight shuffle, but bpreshuffle is {self.is_shuffle}"
+            )
+            return []
+        if not native_is_skinny_default_shape(self.m, self.n, self.k, self.indtype):
+            logger.info(
+                f"Skip skinny gemm candidate for M={self.m}, N={self.n}, K={self.k}, indtype={self.indtype}"
+            )
+            return []
+        info = (
+            (
+                self.m,
+                self.n,
+                self.k,
+                False if self.bias is None else True,
+                str(self.indtype),
+                str(self.outdtype),
+                self.scaleAB,
+                self.is_shuffle,
+            ),
+            2,
+            0,
+            "skinny",
+            "sol2",
+        )
+        task = []
+        task.append(
+            (
+                info,
+                generate_data,
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.indtype,
+                    self.outdtype,
+                    self.scaleAB,
+                    self.is_shuffle,
+                    0,
+                    True if self.bias is not None else False,
+                ),
+                run_skinny_gemm_a16w16,
+                ([0, 1, 3], self.outdtype),
+                {
+                    "num_warmup": self.num_warmup,
+                    "num_iters": 101,
+                },
+                get_gemm_ref,
+                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                {},
+                None,
+                self.rtol,
+                self.atol,
+            )
+        )
+        return task
+
+    def torch_gemm_all_sols(self):
+        if self.is_shuffle:
+            logger.warning(
+                "Torch native a16w16 does not support weight shuffle, "
+                f"but bpreshuffle is {self.is_shuffle}"
+            )
+            return []
+        if self.indtype not in [dtypes.fp16, dtypes.bf16, dtypes.fp8]:
+            logger.warning(
+                "Torch native a16w16 only supports fp16/bf16/fp8 input, "
+                f"but actual indtype is {self.indtype}"
+            )
+            return []
+        info = (
+            (
+                self.m,
+                self.n,
+                self.k,
+                False if self.bias is None else True,
+                str(self.indtype),
+                str(self.outdtype),
+                self.scaleAB,
+                self.is_shuffle,
+            ),
+            0,
+            0,
+            "torch",
+            "native",
+        )
+        task = []
+        task.append(
+            (
+                info,
+                generate_data,
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.indtype,
+                    self.outdtype,
+                    self.scaleAB,
+                    self.is_shuffle,
+                    0,
+                    True if self.bias is not None else False,
+                ),
+                run_torch_gemm_a16w16,
+                ([0, 1, 3, 4, 7], self.outdtype),
+                {
+                    "num_warmup": self.num_warmup,
+                    "num_iters": 101,
+                },
+                get_gemm_ref,
+                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                {},
+                None,
+                self.rtol,
+                self.atol,
+            )
         )
         return task
 
@@ -820,7 +994,15 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl"]:
+        if value not in [
+            "all",
+            "asm",
+            "hipblaslt",
+            "triton",
+            "flydsl",
+            "torch",
+            "skinny",
+        ]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -879,7 +1061,7 @@ class GemmTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl', 'torch', 'skinny']",
         )
 
     def __init__(

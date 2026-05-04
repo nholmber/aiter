@@ -344,6 +344,13 @@ void mla_decode_stage1_asm_fwd(
                     ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
         }
+    } else if (gqa_ratio == 8){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        }
     }
 
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
@@ -353,7 +360,6 @@ void mla_decode_stage1_asm_fwd(
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
-
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
