@@ -35,7 +35,12 @@ _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
     device = topk_ids.device
     M = topk_ids.shape[0]
-    moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
+    # The FLAT fmoe asm kernel performs an in-kernel leader-only buffer_atomic_swap
+    # zeroing pass over each token's dst row right after its SRD is built (well
+    # before any global_atomic_pk_add_bf16 reaches L2), so moe_buf can be left
+    # uninitialized here. This eliminates the host-side torch.zeros() launch
+    # (~2us aten::fill_ at small-M / dim=2048).
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     topk_ids_i32 = (
         topk_ids
         if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
