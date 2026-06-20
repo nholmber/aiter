@@ -1,0 +1,29 @@
+FROM vllm/vllm-openai-rocm:nightly-93bad119120d0f9bff707dcbf5af5c029158b969
+
+# Uninstall existing vLLM and AITER
+RUN pip uninstall -y vllm amd-aiter || true && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/vllm* \
+           /usr/local/lib/python3.12/dist-packages/aiter* \
+           /usr/local/lib/python3.12/dist-packages/aiter_meta* \
+           /usr/local/lib/python3.12/dist-packages/amd_aiter*
+
+# Build AITER from source (Sergey's gfx950_fmha_fp8_hd256 branch + MI355X tuned CSVs)
+ARG AITER_REPO=https://github.com/nholmber/aiter.git
+ARG AITER_BRANCH=feat/qwen35-gfx950-optimizations
+RUN git clone --depth 1 --branch ${AITER_BRANCH} ${AITER_REPO} /tmp/aiter && \
+    cd /tmp/aiter && \
+    git submodule update --init --depth 1 && \
+    pip install --no-build-isolation -e . && \
+    rm -rf /tmp/aiter
+
+# Build vLLM from source (FSE fix + MTP MXFP4 fix + FP8 FMHA hd256)
+ARG VLLM_REPO=https://github.com/nholmber/vllm.git
+ARG VLLM_BRANCH=feat/qwen35-fp8attn-mtp-fse
+ENV VLLM_INSTALL_PUNICA_KERNELS=0
+RUN git clone --depth 1 --branch ${VLLM_BRANCH} ${VLLM_REPO} /tmp/vllm && \
+    cd /tmp/vllm && \
+    pip install --no-build-isolation -e . && \
+    rm -rf /tmp/vllm
+
+ENTRYPOINT []
+CMD ["bash"]
