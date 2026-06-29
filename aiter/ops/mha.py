@@ -1655,7 +1655,10 @@ def _flash_attn_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -1676,8 +1679,11 @@ def _flash_attn_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
@@ -2618,7 +2624,10 @@ def _flash_attn_varlen_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2640,8 +2649,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
@@ -3024,6 +3036,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
         sink_ptr=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3055,9 +3070,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -3224,6 +3239,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3429,6 +3447,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
