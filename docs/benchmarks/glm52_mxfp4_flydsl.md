@@ -530,3 +530,33 @@ inline quantization across every routed expert/N tile.
 The main risks are software grid synchronization, workspace epoch/reset
 handling, and ensuring the designated sorter workgroup is resident to avoid
 deadlock.
+
+### Persistent block-0 sorter prototype result
+
+A prototype was implemented with:
+
+- An epoch-tagged global ready flag.
+- Block 0 performing the complete routed sort.
+- A fixed persistent worker grid.
+- A global atomic GEMM1 task queue.
+- Dense routed blocks consumed by the sparse-grouped Stage 2.
+
+Results at shared M=16:
+
+| Persistent workers | Latency (us) | Correct |
+|-------------------:|-------------:|:--------|
+| 256 | ~329 | Yes |
+| 128 | ~230 | Yes |
+| 64 | ~219 | No |
+
+The software barrier did not deadlock at 128 or 256 workers, but the design is
+far slower than the ~91 us sparse-grouped path. The dominant overheads are the
+serialized block-0 sort, spin waiting, global task-queue atomics, and repeated
+per-task workgroup barriers. Reducing the worker count increases the number of
+statically unrolled queue passes and eventually failed to process the output
+correctly at 64 workers.
+
+The prototype code was removed. If persistence is revisited, it should use the
+existing all-block arrival/last-arriver barrier pattern from
+`moe_fused_route_quant_scatter.py`, where all workgroups participate in the
+counting phase and the last arriver performs only the prefix/dispatch step.
