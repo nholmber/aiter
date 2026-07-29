@@ -713,6 +713,48 @@ than route/expert addressing. The incorrect prototype code was removed.
 A viable token-centric implementation therefore needs a genuinely wave-native
 MFMA loop and cannot safely reuse the current four-wave cooperative GEMM1 body.
 
+#### Serial-route geometry stepping stone
+
+Before another wave-native MFMA rewrite, validate the token/phase dispatch and
+route-private output mapping with a correctness-first kernel:
+
+- Grid: `M * 2 phases * 16 logical-N chunks`, plus 16 grouped shared-expert
+  workgroups.
+- Each routed workgroup invokes the existing correct BN64 GEMM1 body four
+  times serially for the four routes in its phase.
+- Routed intermediate blocks remain `token * 8 + slot`; the final block is the
+  grouped expert-256 intermediate consumed by the existing shared-hybrid
+  Stage 2.
+- Input quantization is intentionally repeated. This prototype tests only
+  whether consolidating dispatch around `(token, phase, logical-N)` is correct
+  and remotely viable before factoring quantization outside the route loop.
+
+The expected grids are 272 workgroups at M=8 and 528 at M=16. A useful result
+would justify replacing the four serial bodies with a wave-native multi-expert
+body; a large regression would stop that rewrite early.
+
+The serial-route prototype compiled and produced correct shared-routing output:
+
+- M=8 normalized difference: approximately `5.1e-6`
+- M=16 normalized difference: approximately `5.3e-6`
+
+Stable stage profiles were:
+
+| M | Serial Stage 1 (us) | Shared-hybrid Stage 2 (us) | Sum (us) |
+|---:|--------------------:|----------------------------:|---------:|
+| 8  | 66.61 | 15.32 | 81.93 |
+| 16 | 84.66 | 29.20 | 113.86 |
+
+The M=8 end-to-end smoke measurement was approximately 84.0 us and M=16 was
+approximately 114.0 us. These are intentionally not competitive: the routed
+workgroup repeats the complete quantize/GEMM/epilogue body four times.
+
+The useful result is correctness of the `M * 2 * 16` dispatch and the
+route-private output layout. The remaining upside is concentrated entirely in
+Stage 1, so the next implementation should retain this grid while replacing
+the four serial bodies with one shared A quantization and four wave-native
+expert bodies.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave
