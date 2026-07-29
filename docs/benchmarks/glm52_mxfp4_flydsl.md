@@ -601,3 +601,73 @@ BN256 to BN128:
 BN128 helps sparse route-direct layouts but regresses the dense sorted M=16
 pipeline. Main's BN256 GEMM1 remains the correct tile once expert rows are
 already compacted.
+
+## Remaining longshot directions
+
+### 1. Fused sort plus one-time input quantization
+
+Quantize each BF16 token once, then reuse the FP4 activation and e8m0 scales
+across all routed experts and GEMM1 N tiles. The route/quant preparation could
+use the existing fused dynamic MXFP4 quant-and-sort path.
+
+Advantages:
+
+- Removes repeated BF16 loads and quantization arithmetic from every routed
+  GEMM1 workgroup.
+- Uses conventional compact GEMM1/GEMM2 kernels with no software grid barrier.
+
+Risks:
+
+- Adds a third external launch.
+- Main selected `f16in` because separate quantization historically lost at
+  smaller token counts; M=16 shared routing must be remeasured rather than
+  inferred from the older normal-routing rows.
+
+This is the lowest-risk remaining experiment.
+
+### 2. Token-centric multi-expert GEMM1
+
+Dispatch one workgroup around a token/N tile instead of an expert/N tile.
+Quantize the token once into LDS, then assign waves to different routed experts
+and reuse the same A tile.
+
+For M=8, small logical N tiles could still produce approximately one workgroup
+per CU while eliminating eight repeated activation quantizations per token.
+
+Risks:
+
+- Every wave uses a different B expert, requiring a new weight/scale addressing
+  and scheduling scheme.
+- Four waves can process only four experts concurrently, requiring multiple
+  expert phases for top-8 routing.
+- Register pressure and long-lived LDS A tiles may reduce occupancy.
+
+This is the highest-upside two-launch design, but requires a new GEMM1 body.
+
+### 3. Multi-route wave-specialized workgroups
+
+Pack independent route/N tasks into the four waves of one workgroup. Each wave
+uses its own expert and B tile while sharing only dispatch and synchronization
+infrastructure.
+
+This reduces workgroup scheduling overhead but does not remove repeated
+quantization unless combined with the token-centric design. It is less likely
+to move M=16, where workgroup count is already sufficient.
+
+### 4. Atomic-free shared-output initialization
+
+Let the grouped shared expert write the initial output non-atomically, then add
+routed experts atomically.
+
+This requires a per-token producer/consumer ordering mechanism inside Stage 2.
+Without a device-wide ordering primitive it risks the same residency and
+spin-wait problems as the rejected persistent prototypes.
+
+### 5. Shared-routing-specific retune of main `f16in`
+
+Sweep the existing main kernel candidates under deterministic shared routing,
+including GEMM1/GEMM2 BM, cache policy, XCD swizzle, atomic/reduce epilogues,
+and persistent Stage 2.
+
+This does not create a new fused kernel, but it is more likely to improve the
+production M=16 result than further candidate-local sorting work.
