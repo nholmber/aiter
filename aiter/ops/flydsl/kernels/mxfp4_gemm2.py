@@ -348,6 +348,10 @@ def _gemm2_body(
     BN,
     BK,
     KH_TILE,
+    direct_route=False,
+    direct_expert=None,
+    direct_token=None,
+    direct_weight=None,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -371,8 +375,11 @@ def _gemm2_body(
 
     m_block_idx = _udiv(bx_i32, _num_n_blocks)
     n_block_idx = bx_i32 - m_block_idx * fx.Int32(_num_n_blocks)
-    e = llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
-    e = rocdl.readfirstlane(T.i32, e)
+    if const_expr(direct_route):
+        e = rocdl.readfirstlane(T.i32, _raw(fx.Int32(direct_expert)))
+    else:
+        e = llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
+        e = rocdl.readfirstlane(T.i32, e)
     m_row = m_block_idx * fx.Int32(BM)
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
@@ -632,6 +639,9 @@ def _gemm2_body(
             BM,
             N_OUT,
             BN,
+            direct_route=direct_route,
+            direct_token=direct_token,
+            direct_weight=direct_weight,
         )
 
 
@@ -796,6 +806,10 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    *,
+    direct_route=False,
+    direct_token=None,
+    direct_weight=None,
 ):
     _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
@@ -815,16 +829,22 @@ def _atomic_bf16_epilog(
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(
-            llvm.load(
-                T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True
+        if const_expr(direct_route):
+            packed.append(fx.Int32(0))
+            weight.append(fx.Float32(direct_weight))
+        else:
+            packed.append(
+                llvm.load(
+                    T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True
+                )
             )
-        )
-        weight.append(
-            llvm.load(
-                T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
+            weight.append(
+                llvm.load(
+                    T.f32,
+                    _gep1(sweights_base, sorted_pos * fx.Int32(4)),
+                    invariant=True,
+                )
             )
-        )
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -839,7 +859,20 @@ def _atomic_bf16_epilog(
 
     for mr in range_constexpr(M_REPS):
         row_in_block = fx.Int32(mr * 8) + m_lane
-        token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+        if const_expr(direct_route):
+            if const_expr(mr == 0):
+                is_live = m_lane == fx.Int32(0)
+                token_id = fx.Int32(
+                    arith.select(
+                        _raw(is_live),
+                        _raw(fx.Int32(direct_token)),
+                        _raw(i32_M),
+                    )
+                )
+            else:
+                token_id = i32_M
+        else:
+            token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         if token_id < i32_M:
             row_base_addr = (
                 token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start

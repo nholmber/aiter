@@ -13,6 +13,7 @@ from .mxfp4_gemm_common import (
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
+    _gep3,
     _inline_dpp_quad_amax,
     _lds_swizzle_mask,
     _raw,
@@ -157,6 +158,16 @@ def _gemm1_body(
     N_OUT,
     NE,
     interleave=False,
+    direct_route=False,
+    direct_expert=None,
+    direct_token=None,
+    direct_mapped_rows=False,
+    mapped_output=False,
+    output_block_stride=1,
+    output_row_limit=None,
+    local_route_map_ptr=None,
+    local_route_map_byte_offset=0,
+    local_route_topk=1,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -179,7 +190,10 @@ def _gemm1_body(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(direct_route):
+        e = rocdl.readfirstlane(T.i32, _raw(fx.Int32(direct_expert)))
+    else:
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
@@ -242,10 +256,40 @@ def _gemm1_body(
     # +kAStages*BM*KH_TILE.
 
     cached_actual_row = []
-    cached_row_inline = None
+    cached_rows_inline = []
+    cached_output_rows_inline = []
+    direct_row_valid = None
     if const_expr(inline_quant):
         rcls = wave * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+        for row_group in range_constexpr(BM // 16):
+            row_idx = m_row + rcls + fx.Int32(row_group * 16)
+            if const_expr(direct_route):
+                if const_expr(direct_mapped_rows):
+                    route = fx.Int32(
+                        llvm.load(
+                            T.i32,
+                            _gep3(
+                                local_route_map_ptr,
+                                fx.Int32(local_route_map_byte_offset)
+                                + (
+                                    rcls + fx.Int32(row_group * 16)
+                                )
+                                * fx.Int32(4),
+                            ),
+                        )
+                    )
+                    cached_rows_inline.append(
+                        route // fx.Int32(local_route_topk)
+                    )
+                    cached_output_rows_inline.append(route)
+                else:
+                    cached_rows_inline.append(fx.Int32(direct_token))
+                    if const_expr(row_group == 0):
+                        direct_row_valid = rcls == fx.Int32(0)
+                    else:
+                        direct_row_valid = rcls < fx.Int32(0)
+            else:
+                cached_rows_inline.append(_global_i32_at(arg_mind, row_idx))
     else:
         for sub in range_constexpr(kSubBlocks):
             idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
@@ -407,7 +451,19 @@ def _gemm1_body(
             r,
             soffset=s_soff // fx.Int32(4),
         )
-        return r.load()
+        h_v = r.load()
+        if const_expr(direct_route and not direct_mapped_rows):
+            return [
+                fx.Int32(
+                    arith.select(
+                        _raw(direct_row_valid),
+                        _raw(fx.Int32(_raw(h_v[j]))),
+                        _raw(fx.Int32(0)),
+                    )
+                )
+                for j in range_constexpr(4)
+            ]
+        return h_v
 
     def _inline_quant_core_batch(specs, slot, scale_accum):
         n = len(specs)
@@ -564,14 +620,26 @@ def _gemm1_body(
     for K_C in range_constexpr(kStages):
         if const_expr(inline_quant):
             scale_accum = fx.Int32(0)
-            scale_accum = inline_quant_kt(
-                0, 0, K_C, K_C, cached_row_inline, scale_accum
-            )
+            for row_group in range_constexpr(BM // 16):
+                scale_accum = inline_quant_kt(
+                    0,
+                    row_group,
+                    K_C,
+                    K_C,
+                    cached_rows_inline[row_group],
+                    scale_accum,
+                )
             issue_b_load_j(b[K_C], K_C, 0)
             issue_b_load_j(b[K_C], K_C, 1)
-            scale_accum = inline_quant_kt(
-                1, 0, K_C, K_C, cached_row_inline, scale_accum
-            )
+            for row_group in range_constexpr(BM // 16):
+                scale_accum = inline_quant_kt(
+                    1,
+                    row_group,
+                    K_C,
+                    K_C,
+                    cached_rows_inline[row_group],
+                    scale_accum,
+                )
             issue_b_load_j(b[K_C], K_C, 2)
             issue_b_load_j(b[K_C], K_C, 3)
             inline_quant_pack_write(K_C, scale_accum)
@@ -604,8 +672,20 @@ def _gemm1_body(
         if const_expr(not inline_quant):
             issue_a_load_lds(write_slot, K_C)
         if const_expr(inline_quant):
-            h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-            h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
+            h_vs = []
+            for B128_IDX in range_constexpr(2):
+                for row_group in range_constexpr(BM // 16):
+                    h_vs.append(
+                        (
+                            B128_IDX,
+                            row_group,
+                            inline_quant_load_kt(
+                                B128_IDX,
+                                K_C,
+                                cached_rows_inline[row_group],
+                            ),
+                        )
+                    )
             rocdl.sched_barrier(0)
         for J in range_constexpr(4):
             if const_expr(BM != 128):
@@ -622,7 +702,7 @@ def _gemm1_body(
         issue_b_scale_load(b_scale_v[slot_b], K_C)
         if const_expr(inline_quant):
             scale_accum = _inline_quant_core_batch(
-                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
+                h_vs, write_slot, fx.Int32(0)
             )
             inline_quant_pack_write(K_C, scale_accum)
 
@@ -730,9 +810,20 @@ def _gemm1_body(
             + wave_grp * fx.Int32(16)
             + kk * fx.Int32(4)
         )
-        out_row = m_row + row_local
+        if const_expr(mapped_output):
+            output_row = cached_output_rows_inline[mr]
+            out_row = output_row * fx.Int32(output_block_stride * BM)
+        else:
+            output_row = None
+            out_row = m_row + row_local
         store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-        _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
+        if const_expr(mapped_output):
+            if output_row < fx.Int32(output_row_limit):
+                _scalar_store(
+                    aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32
+                )
+        else:
+            _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
 
     # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
     ascaleout_layout = fx.make_layout(
@@ -744,10 +835,26 @@ def _gemm1_body(
         ku = n_block_idx >> fx.Int32(1)
         ikxdl = n_block_idx & fx.Int32(1)
         if const_expr(BM == 16):
-            chunk = m_block_idx
-            dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
-            addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
+            if const_expr(mapped_output):
+                output_row = cached_output_rows_inline[0]
+                chunk = output_row * fx.Int32(output_block_stride)
+                dword_off = _layout_idx(
+                    ascaleout_layout, chunk, ku, wave_grp, fx.Int32(0)
+                )
+                addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                if output_row < fx.Int32(output_row_limit):
+                    _scalar_store(
+                        ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8
+                    )
+            else:
+                chunk = m_block_idx
+                dword_off = _layout_idx(
+                    ascaleout_layout, chunk, ku, wave_grp, m_lane
+                )
+                addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                _scalar_store(
+                    ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8
+                )
         else:
             for sub in range_constexpr(kSubBlocks):
                 chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
@@ -792,6 +899,7 @@ def compile_gemm1_a4w4_port(
         (64, False, False),
         (128, False, False),
         (16, True, True),
+        (32, True, True),
     }:
         raise AssertionError(
             f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"

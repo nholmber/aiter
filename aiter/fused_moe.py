@@ -718,7 +718,7 @@ def fused_moe_(
     assert not metadata.flat or get_gfx() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels require gfx942/gfx950; got {get_gfx()}. "
+    ), f"FLAT fmoe kernels require gfx942/gfx950; got {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1699,6 +1699,81 @@ def _mxfp4_scale_u8(scale):
     return scale
 
 
+def _mxfp4_flat_stage1_fw(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    w1_scale=None,
+    moe_buf=None,
+    kernelName1="",
+    **_kwargs,
+):
+    del w2, sorted_expert_ids, num_valid_ids, out, topk
+    if moe_buf is None or moe_buf.numel() == 0:
+        raise ValueError("flat MXFP4 Stage 1 requires the final output buffer")
+    if w1.element_size() == 1 and w1.dtype != torch.uint8:
+        w1 = w1.view(torch.uint8)
+
+    from aiter.ops.flydsl.mxfp4_flat_moe_kernels import (
+        flydsl_mxfp4_flat_stage1,
+    )
+
+    return flydsl_mxfp4_flat_stage1(
+        hidden_states=hidden_states,
+        w1=w1,
+        w1_scale=_mxfp4_scale_u8(w1_scale),
+        topk_ids=sorted_token_ids,
+        out=moe_buf,
+        use_nt="_nt" in kernelName1,
+        interleave="_il" in kernelName1,
+    )
+
+
+def _mxfp4_flat_stage2_fw(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    kernelName2="",
+    **_kwargs,
+):
+    del sorted_expert_ids, num_valid_ids, topk
+    if sorted_weights is None:
+        raise ValueError("flat MXFP4 Stage 2 requires raw top-k weights")
+    if w2.element_size() == 1 and w2.dtype != torch.uint8:
+        w2 = w2.view(torch.uint8)
+
+    from aiter.ops.flydsl.mxfp4_flat_moe_kernels import (
+        flydsl_mxfp4_flat_stage2,
+    )
+
+    return flydsl_mxfp4_flat_stage2(
+        inter_q=inter_states,
+        inter_scale=a2_scale,
+        w2=w2,
+        w2_scale=_mxfp4_scale_u8(w2_scale),
+        topk_ids=sorted_token_ids,
+        topk_weights=sorted_weights,
+        out=out,
+        D_INTER=w1.shape[1] // 2,
+        use_nt="_nt" in kernelName2,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2001,6 +2076,24 @@ def get_2stage_cfgs(
             return 32
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
+
+    if isinstance(kernelName1, str) and kernelName1.startswith(
+        "flydsl_mxmoe_flat_g1_a4w4_"
+    ):
+        return MOEMetadata(
+            stage1=functools.partial(
+                _mxfp4_flat_stage1_fw, kernelName1=kernelName1
+            ),
+            stage2=functools.partial(
+                _mxfp4_flat_stage2_fw, kernelName2=kernelName2
+            ),
+            block_m=16,
+            ksplit=0,
+            run_1stage=False,
+            flat=True,
+            fuse_quant="fp4",
+            prequant=False,
+        )
 
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         # gate_mode is a runtime weight-layout property, not a tuning key: route
@@ -2677,6 +2770,8 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
+    elif stage1_func is _mxfp4_flat_stage1_fw:
+        extra_stage1_args["moe_buf"] = _sort_moe_buf
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,
@@ -2712,13 +2807,16 @@ def fused_moe_2stages(
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
-        _fp4_bytes = token_num * topk * (inter_dim // 2)
-        a2 = (
-            a2_raw.view(-1)
-            .view(torch.uint8)[:_fp4_bytes]
-            .view(dtypes.fp4x2)
-            .reshape(token_num, topk, -1)
-        )
+        if stage1_func is _mxfp4_flat_stage1_fw:
+            a2 = a2_raw
+        else:
+            _fp4_bytes = token_num * topk * (inter_dim // 2)
+            a2 = (
+                a2_raw.view(-1)
+                .view(torch.uint8)[:_fp4_bytes]
+                .view(dtypes.fp4x2)
+                .reshape(token_num, topk, -1)
+            )
     elif metadata.fuse_quant == "fp8" and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
         a2 = a2.view(token_num, topk, -1)

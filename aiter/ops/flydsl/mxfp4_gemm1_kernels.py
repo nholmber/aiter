@@ -14,6 +14,7 @@ _SUPPORTED = {
     (64, False, False),
     (128, False, False),
     (16, True, True),
+    (32, True, True),
 }
 
 
