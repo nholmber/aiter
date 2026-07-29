@@ -229,3 +229,54 @@ general sorting overhead. Closing the final gap therefore requires either:
 
 The next higher-leverage work remains the sparse N-tiling sequence:
 BN128 for M=4, BN64/K-wave2 for M=2, and BN32/K-wave4 for M=1.
+
+## BN128 sparse GEMM1 results
+
+GEMM1 was generalized from BN256 to BN128 for separated gate/up weights.
+GEMM2 remains BN256.
+
+The BN128 implementation uses:
+
+- Eight GEMM1 N blocks instead of four.
+- Two 16-column MFMA J tiles per wave.
+- Wave parity to select the low/high half of each 32-row weight/scale pack.
+- An explicit `scf.if` with separate even/odd-wave MFMA instruction sequences,
+  because `opselB` must be a compile-time immediate.
+- BN-independent FP4 output and e8m0 scale addressing.
+
+The first attempt passed wave parity as a runtime `opselB` and failed during
+FlyDSL lowering. A Python `if` also failed to carry the accumulator SSA value
+out of the branch. The explicit result-producing `scf.IfOp` is required.
+
+### Normal routing
+
+Same-process forced-main comparison:
+
+| M | Main `f16in` (us) | Flat BN128 (us) | Delta |
+|---:|------------------:|----------------:|------:|
+| 1 | 24.427 | 19.703 | -19.34% |
+| 2 | 28.214 | 22.935 | -18.72% |
+| 4 | 36.415 | 33.528 | -7.93% |
+
+### Shared-expert routing
+
+| M | Main `f16in` (us) | Flat BN128 (us) | Hybrid BN128 (us) | Selected |
+|---:|------------------:|----------------:|------------------:|:---------|
+| 1 | 24.554 | 19.838 | 20.604 | Flat |
+| 2 | 28.069 | 21.871 | 22.990 | Flat |
+| 4 | 35.371 | 33.108 | 32.795 | Hybrid |
+
+Normalized differences remained approximately `5e-6` to `1.3e-5`.
+
+### Automatic low-M dispatch
+
+- Flat M=1-4 defaults to GEMM1 BN128.
+- Shared hybrid M=1-4 defaults to GEMM1 BN128.
+- Shared production selection:
+  - M=1-2: flat BN128
+  - M=4: shared hybrid BN128
+  - M=8: shared hybrid BN256
+  - M=12-16: embedded sort BN256
+
+BN128 already beats forced main at M=1/2/4, so BN64/K-wave2 and
+BN32/K-wave4 are now optional follow-up optimizations rather than blockers.

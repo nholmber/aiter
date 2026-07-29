@@ -43,9 +43,13 @@ def compile_mxfp4_shared_hybrid_stage1(
     interleave=False,
 ):
     """Sparse routed GEMM1 plus one grouped shared-expert GEMM1."""
-    if BM != 16 or BN != 256 or BK != 256:
+    if BM != 16 or BN not in (128, 256) or BK != 256:
         raise ValueError(
-            "shared-hybrid Stage 1 requires BM=16 and BN=BK=256"
+            "shared-hybrid Stage 1 requires BM=16, BN in {128,256}, and BK=256"
+        )
+    if BN == 128 and interleave:
+        raise ValueError(
+            "shared-hybrid Stage-1 BN128 supports separated gate/up only"
         )
     if TOPK < 2:
         raise ValueError("shared-hybrid Stage 1 requires TOPK >= 2")
@@ -60,9 +64,10 @@ def compile_mxfp4_shared_hybrid_stage1(
     gu_tag = "il" if interleave else "sep"
     rnt_tag = "nt" if routed_use_nt else "cached"
     snt_tag = "nt" if shared_use_nt else "cached"
+    bn_tag = "" if BN == 256 else f"_bn{BN}"
     name = (
         f"mxfp4_shared_hybrid_g1_h{D_HIDDEN}_i{D_INTER}_ne{NE}_tk{TOPK}"
-        f"_bm{BM}_r{rnt_tag}_s{snt_tag}_{gu_tag}_v1"
+        f"_bm{BM}_r{rnt_tag}_s{snt_tag}_{gu_tag}{bn_tag}_v1"
     )
 
     @fx.struct

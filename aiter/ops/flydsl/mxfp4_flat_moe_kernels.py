@@ -192,11 +192,14 @@ def flydsl_mxfp4_flat_moe(
     out=None,
     stage1_use_nt=True,
     stage2_use_nt=False,
+    stage1_bn=None,
     interleave=False,
     stage2_dispatch_n_groups=0,
     stream=None,
 ):
     M, D_HIDDEN, D_INTER, _, _ = _logical_shape(hidden_states, w1, topk_ids)
+    if stage1_bn is None:
+        stage1_bn = 128 if M <= 4 else 256
     if out is None:
         out = torch.empty(
             (M, D_HIDDEN), dtype=torch.bfloat16, device=hidden_states.device
@@ -209,6 +212,7 @@ def flydsl_mxfp4_flat_moe(
         out=out,
         use_nt=stage1_use_nt,
         interleave=interleave,
+        BN=stage1_bn,
         stream=stream,
     )
     return flydsl_mxfp4_flat_stage2(

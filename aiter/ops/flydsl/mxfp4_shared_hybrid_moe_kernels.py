@@ -17,6 +17,7 @@ def _get_stage1(
     routed_use_nt,
     shared_use_nt,
     interleave,
+    BN,
 ):
     from .kernels.mxfp4_shared_hybrid_moe import (
         compile_mxfp4_shared_hybrid_stage1,
@@ -30,6 +31,7 @@ def _get_stage1(
         routed_use_nt=routed_use_nt,
         shared_use_nt=shared_use_nt,
         interleave=interleave,
+        BN=BN,
     )
 
 
@@ -70,6 +72,7 @@ def flydsl_mxfp4_shared_hybrid_moe(
     out=None,
     stage1_routed_use_nt=True,
     stage1_shared_use_nt=False,
+    stage1_bn=None,
     stage2_routed_use_nt=False,
     stage2_shared_use_nt=False,
     shared_weight_is_one=True,
@@ -97,6 +100,8 @@ def flydsl_mxfp4_shared_hybrid_moe(
         raise ValueError(
             "shared-hybrid path requires hidden/inter dimensions divisible by 256"
         )
+    if stage1_bn is None:
+        stage1_bn = 128 if M <= 4 else 256
 
     routed_topk = TOPK - 1
     max_m_blocks = M * routed_topk + 1
@@ -133,6 +138,7 @@ def flydsl_mxfp4_shared_hybrid_moe(
         stage1_routed_use_nt,
         stage1_shared_use_nt,
         interleave,
+        stage1_bn,
     )
     _moe_kernels._run_compiled(
         stage1,

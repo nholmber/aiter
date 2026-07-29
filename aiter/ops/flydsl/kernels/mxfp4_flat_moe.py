@@ -46,8 +46,12 @@ def compile_mxfp4_flat_stage1(
     use_nt: bool = True,
     interleave: bool = False,
 ):
-    if BM != 16 or BN != 256 or BK != 256:
-        raise ValueError("flat Stage 1 currently requires BM=16 and BN=BK=256")
+    if BM != 16 or BN not in (128, 256) or BK != 256:
+        raise ValueError(
+            "flat Stage 1 requires BM=16, BN in {128,256}, and BK=256"
+        )
+    if BN == 128 and interleave:
+        raise ValueError("flat Stage-1 BN128 supports separated gate/up only")
 
     kh_tile = BK // 2
     n_out = 2 * D_INTER
@@ -57,9 +61,10 @@ def compile_mxfp4_flat_stage1(
     )
     gu_tag = "il" if interleave else "sep"
     nt_tag = "nt" if use_nt else "cached"
+    bn_tag = "" if BN == 256 else f"_bn{BN}"
     name = (
         f"mxfp4_flat_g1_h{D_HIDDEN}_i{D_INTER}_ne{NE}_tk{TOPK}"
-        f"_bm{BM}_{nt_tag}_{gu_tag}_v1"
+        f"_bm{BM}_{nt_tag}_{gu_tag}{bn_tag}_v1"
     )
 
     @fx.struct
