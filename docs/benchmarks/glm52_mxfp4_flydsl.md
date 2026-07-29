@@ -690,6 +690,29 @@ For each token:
 This avoids the cross-workgroup FP4 scale problem that made BN32 invalid:
 each wave emits a complete 32-value logical chunk (raw gate/up width 64).
 
+#### Token-centric prototype result
+
+A prototype reused the existing four-wave GEMM1 loop with:
+
+- A different routed expert per physical wave.
+- One shared quantized token row in LDS.
+- A wave-local SiLU, 32-value amax reduction, FP4 packing, and scale store.
+
+Performance at shared M=8 was promising at approximately 52.36 us, but the
+output was incorrect:
+
+- Wave 0 / route 0 was bit-exact.
+- Waves 1-3 produced incorrect FP4 values.
+- The second four-expert phase produced zero rows.
+- End-to-end normalized difference was approximately 0.335.
+
+Forcing all waves to the same expert did not fix waves 1-3, confirming that the
+failure is in the existing GEMM body's physical-wave B/MFMA assumptions rather
+than route/expert addressing. The incorrect prototype code was removed.
+
+A viable token-centric implementation therefore needs a genuinely wave-native
+MFMA loop and cannot safely reuse the current four-wave cooperative GEMM1 body.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave
