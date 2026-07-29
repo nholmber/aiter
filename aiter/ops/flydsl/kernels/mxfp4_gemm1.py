@@ -162,6 +162,7 @@ def _gemm1_body(
     direct_expert=None,
     direct_token=None,
     direct_mapped_rows=False,
+    direct_sequential_rows=False,
     mapped_output=False,
     output_block_stride=1,
     output_row_limit=None,
@@ -282,6 +283,13 @@ def _gemm1_body(
                         route // fx.Int32(local_route_topk)
                     )
                     cached_output_rows_inline.append(route)
+                elif const_expr(direct_sequential_rows):
+                    row_token = rcls + fx.Int32(row_group * 16)
+                    cached_rows_inline.append(
+                        (row_token < i32_ntok).select(
+                            row_token, i32_ntok
+                        )
+                    )
                 else:
                     cached_rows_inline.append(fx.Int32(direct_token))
                     if const_expr(row_group == 0):
@@ -452,7 +460,11 @@ def _gemm1_body(
             soffset=s_soff // fx.Int32(4),
         )
         h_v = r.load()
-        if const_expr(direct_route and not direct_mapped_rows):
+        if const_expr(
+            direct_route
+            and not direct_mapped_rows
+            and not direct_sequential_rows
+        ):
             return [
                 fx.Int32(
                     arith.select(

@@ -126,3 +126,106 @@ longer compensates for the embedded bookkeeping.
 - M=16: latest-main `f16in` wins.
 
 No production tuning CSV rows are enabled for the new kernels.
+
+## Next experiment: deterministic shared-expert hybrid
+
+GLM-5.2 routes the shared expert deterministically in the final top-k slot:
+
+- Expert count: 257
+- Shared expert ID: 256 (zero-based)
+- Top-k: 9
+- Shared slot: 8 (zero-based)
+- Shared routed weight: exactly 1.0
+
+This permits a specialized two-launch path with no general sorting:
+
+1. The first eight routes remain sparse and route-direct.
+2. The final route is removed from the sparse grid and processed as one
+   grouped BM16 shared-expert block containing all M tokens.
+3. Stage 2 similarly uses route-direct workgroups for the first eight routes
+   and one grouped shared-expert block.
+4. The shared Stage-2 epilogue specializes the routed weight to 1.0 and skips
+   shared-weight loads and multiplies.
+
+For M=8 and GEMM1 BN256, the intended Stage-1 grid is:
+
+- Routed: `8 tokens * 8 routes * 4 N blocks = 256` workgroups
+- Shared: `4 N blocks`
+- Total: 260 workgroups
+
+This should provide approximately one routed workgroup per CU without route
+scans, leader detection, LDS sorting atomics, or duplicated shared-expert
+GEMM2 work.
+
+The primary hypotheses are:
+
+- Shared-expert M=8 should recover the largest current regression.
+- M=12/16 should benefit from eliminating general embedded-sort bookkeeping.
+- M=1/2/4 will still require finer GEMM1 N tiling:
+  - M=1: BN32 with K-wave4
+  - M=2: BN64 with K-wave2
+  - M=4: BN128 with K-wave1
+  - M>=8: BN256 with K-wave1
+
+The first implementation will keep BN256 and validate the hybrid dispatch
+before introducing the smaller-N/K-wave variants.
+
+## Deterministic shared-expert hybrid results
+
+The BN256 hybrid was implemented with:
+
+- Routed slots 0-7 dispatched route-directly.
+- Shared slot 8 grouped into one BM16 block.
+- Shared expert ID fixed to 256.
+- Shared routed weight specialized to 1.0.
+- Routed Stage-1 weights non-temporal.
+- Shared Stage-1 and all Stage-2 weights cached.
+- Routed workgroups scheduled before the four shared Stage-1 workgroups.
+
+The table compares the forced main `f16in` pipeline, the previously selected
+flat/embedded-sort path, and the shared hybrid in one process with identical
+weights and shared-expert routes.
+
+| M | Main `f16in` (us) | Previous (us) | Hybrid (us) | Hybrid vs main |
+|---:|------------------:|--------------:|------------:|---------------:|
+| 1  | 24.553 | 30.309 | 30.542 | +24.39% |
+| 2  | 28.025 | 32.099 | 32.942 | +17.54% |
+| 4  | 33.985 | 39.077 | 40.604 | +19.48% |
+| 8  | 51.516 | 56.448 | 53.963 | +4.75% |
+| 12 | 77.780 | 73.425 | 78.247 | +0.60% |
+| 16 | 86.321 | 96.486 | 100.023 | +15.87% |
+
+The hybrid improves the prior shared M=8 path by about 4.4%, but remains about
+4.8% behind forced main `f16in`. It should not replace embedded sort at M=12
+or M=16, where compacting duplicate routed experts is more valuable than only
+special-casing the shared expert.
+
+### M=8 stage breakdown
+
+With the shared-weight=1 specialization:
+
+- Stage 1: approximately 35.39 us
+- Stage 2: approximately 16.24 us
+- Two launches together: approximately 53.08 us
+
+### Rejected hybrid variants
+
+- Shared Stage-1 non-temporal loads regressed by roughly 5 us.
+- Making all Stage-1 loads cached regressed by roughly 3.5 us.
+- Non-temporal Stage-2 loads regressed.
+- Scheduling shared workgroups before routed workgroups regressed the M=8
+  total to roughly 58.4 us. The heavier shared blocks delayed completion of
+  the routed wave; routed-first ordering restored approximately 53 us.
+
+### Hybrid interpretation
+
+The remaining M=8 gap is most likely routed-expert duplication. Main sorting
+groups the approximately six-to-eight duplicate experts among the 64 routed
+slots. The hybrid deliberately leaves those routes independent to avoid
+general sorting overhead. Closing the final gap therefore requires either:
+
+- A cheaper routed-only deduplication mechanism, or
+- Smaller-N sparse GEMM1 tiles that make the route-direct work cheaper.
+
+The next higher-leverage work remains the sparse N-tiling sequence:
+BN128 for M=4, BN64/K-wave2 for M=2, and BN32/K-wave4 for M=1.

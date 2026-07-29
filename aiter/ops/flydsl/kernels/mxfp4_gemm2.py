@@ -352,6 +352,10 @@ def _gemm2_body(
     direct_expert=None,
     direct_token=None,
     direct_weight=None,
+    direct_sequential_rows=False,
+    direct_weight_stride=1,
+    direct_weight_col=0,
+    direct_sequential_weight_one=False,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -642,6 +646,10 @@ def _gemm2_body(
             direct_route=direct_route,
             direct_token=direct_token,
             direct_weight=direct_weight,
+            direct_sequential_rows=direct_sequential_rows,
+            direct_weight_stride=direct_weight_stride,
+            direct_weight_col=direct_weight_col,
+            direct_sequential_weight_one=direct_sequential_weight_one,
         )
 
 
@@ -810,6 +818,10 @@ def _atomic_bf16_epilog(
     direct_route=False,
     direct_token=None,
     direct_weight=None,
+    direct_sequential_rows=False,
+    direct_weight_stride=1,
+    direct_weight_col=0,
+    direct_sequential_weight_one=False,
 ):
     _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
@@ -831,7 +843,39 @@ def _atomic_bf16_epilog(
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
         if const_expr(direct_route):
             packed.append(fx.Int32(0))
-            weight.append(fx.Float32(direct_weight))
+            if const_expr(direct_sequential_rows):
+                if const_expr(direct_sequential_weight_one):
+                    weight.append(fx.Float32(1.0))
+                else:
+                    row = fx.Int32(mr * 8) + m_lane
+                    live = row < i32_M
+                    safe_row = live.select(row, fx.Int32(0))
+                    row_weight = fx.Float32(
+                        llvm.load(
+                            T.f32,
+                            _gep1(
+                                sweights_base,
+                                (
+                                    safe_row
+                                    * fx.Int32(direct_weight_stride)
+                                    + fx.Int32(direct_weight_col)
+                                )
+                                * fx.Int32(4),
+                            ),
+                            invariant=True,
+                        )
+                    )
+                    weight.append(
+                        fx.Float32(
+                            arith.select(
+                                live,
+                                _raw(row_weight),
+                                _raw(fx.Float32(0.0)),
+                            )
+                        )
+                    )
+            else:
+                weight.append(fx.Float32(direct_weight))
         else:
             packed.append(
                 llvm.load(
@@ -860,7 +904,11 @@ def _atomic_bf16_epilog(
     for mr in range_constexpr(M_REPS):
         row_in_block = fx.Int32(mr * 8) + m_lane
         if const_expr(direct_route):
-            if const_expr(mr == 0):
+            if const_expr(direct_sequential_rows):
+                token_id = (row_in_block < i32_M).select(
+                    row_in_block, i32_M
+                )
+            elif const_expr(mr == 0):
                 is_live = m_lane == fx.Int32(0)
                 token_id = fx.Int32(
                     arith.select(
