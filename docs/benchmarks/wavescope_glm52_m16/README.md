@@ -197,24 +197,33 @@ bucket.
 
 ## Recommended experiments
 
-### P0: hybrid unique/duplicate GEMM1
+### P0: keep forced `f16in` as exact-M=16 fallback
 
-Route compaction solved Stage 2. The only remaining structural opportunity is a
-single Stage-1 launch with two work classes:
+The hybrid unique/duplicate GEMM1 was implemented and rejected. It used the
+deterministic route scan to:
 
-- Unique routed experts keep the token-wave shared-A path.
-- Duplicate routed experts are computed once as a grouped BM16 expert block.
+- Suppress token-wave W1 payload/MFMA work for routes with `count > 1`.
+- Add candidate workgroups that run one grouped BM16 GEMM1 per duplicate
+  expert and write the same compact leader/rank layout.
 
-Both classes can derive rank/count from the deterministic routed-ID scan, and
-write the same compact intermediate layout. This is the only remaining
-no-extra-launch design that removes the measured 26.7% excess GEMM1 traffic.
+It was numerically correct, but candidate scanning and grouped-work dispatch
+cost more than the duplicate W1 work they removed:
 
-### P1: keep forced `f16in` as exact-M=16 fallback
+| Duplicate N groups | End-to-end M=16 |
+|---:|---:|
+| 4 | approximately 96.3 us |
+| 2 | approximately 96.4 us |
+| 1 | approximately 125.6 us |
 
-If hybrid GEMM1 bookkeeping costs more than the duplicate work it removes,
-forced sorted `f16in` remains the correct exact-M=16 production choice.
+Four groups repeat the candidate scan too often. One group removes scan
+duplication but leaves too few duplicate workgroups and serializes four N
+blocks. Two groups does not improve the tradeoff. This closes the last
+high-upside no-extra-launch duplicate-GEMM1 direction.
 
-### P2: avoid further software-pipeline variants
+Forced sorted `f16in` therefore remains the correct exact-M=16 production
+choice.
+
+### P1: avoid further software-pipeline variants
 
 The ATT-inspired scheduling experiments were implemented and measured:
 
@@ -232,7 +241,7 @@ the batch waits into serialized `vmcnt(1..4)` waits. The compiler kept VGPRs
 flat, so the regression was scheduling/memory-level parallelism rather than
 occupancy.
 
-### P3: avoid LDS/atomic-first tuning
+### P2: avoid LDS/atomic-first tuning
 
 Do not spend the next iteration on compact-A layout, LDS swizzles, or atomic
 epilogues. ATT and PMC show those are not the limiting resources in the

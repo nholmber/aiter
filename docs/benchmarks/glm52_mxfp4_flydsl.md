@@ -892,6 +892,19 @@ and half-major payload ordering were all implemented and rejected. None beat
 the original four-role batch schedule; detailed negative results are recorded
 in `docs/benchmarks/wavescope_glm52_m16/README.md`.
 
+The final hybrid GEMM1 longshot was also implemented. Token-wave routes with
+`count > 1` suppressed their W1 payload/MFMA work, while added candidate
+workgroups ran grouped BM16 GEMM1 for duplicate experts. It was correct but
+regressed:
+
+- Four duplicate N groups: approximately 96.3 us.
+- Two duplicate N groups: approximately 96.4 us.
+- One duplicate N group: approximately 125.6 us.
+
+Candidate scan overhead dominates at four groups; insufficient duplicate-work
+parallelism dominates at one group. This closes the remaining no-extra-launch
+duplicate-GEMM1 direction. Exact M=16 should use sorted `f16in`.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave
