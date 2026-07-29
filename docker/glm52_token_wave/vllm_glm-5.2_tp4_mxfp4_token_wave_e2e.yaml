@@ -1,0 +1,95 @@
+reporting:
+  type: mlflow
+  args:
+    uri: databricks
+    experiment_name: /amd--GLM-5.2-MXFP4
+    run_name: 20260729_vllm_tp4_glm52_mxfp4_token_wave_ff3b34254_e2e
+    tags:
+      oob_phantom: true
+      public: true
+      framework: vllm
+      variant: token_wave_ff3b34254_e2e
+server:
+  type: docker
+  stop_between_runs: false
+  args:
+    image: nholmber/glm52-token-wave:ff3b34254
+    environment:
+      SAFETENSORS_FAST_GPU: "1"
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: "0"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT4"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "1"
+      VLLM_ROCM_USE_AITER_MHA: "0"
+      VLLM_ROCM_USE_AITER_SPARSE_INDEXER: "1"
+      VLLM_ROCM_USE_AITER_FP4BMM: "0"
+      AITER_USE_FLYDSL_MOE_SORTING: "1"
+      AITER_FP8_PAGED_MQA_LOGITS_FLYDSL: "0"
+      AITER_GLM52_TOKEN_WAVE: "1"
+      AITER_GLM52_TOKEN_WAVE_MIN_M: "5"
+      AITER_GLM52_TOKEN_WAVE_MAX_M: "16"
+      HIP_VISIBLE_DEVICES: "0,1,2,3"
+    command: vllm serve amd/GLM-5.2-MXFP4
+    entrypoint: ""
+    args:
+      async_scheduling: true
+      host: 0.0.0.0
+      port: 8000
+      tensor_parallel_size: 4
+      trust_remote_code: true
+      enable_log_requests: false
+      max_num_seqs: 256
+      block_size: 64
+      gpu_memory_utilization: 0.85
+      max_model_len: 258048
+      kv_cache_dtype: fp8
+      no_enable_prefix_caching: true
+      compilation_config: '{"pass_config": {"fuse_rope_kvcache_cat_mla": true}, "use_inductor_graph_partition": true}'
+    network_mode: host
+    ipc_mode: host
+    volumes:
+      - ${HOST_HF_HUB_CACHE}:/root/.cache/huggingface/hub
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    security_opt:
+      - seccomp=unconfined
+    group_add:
+      - video
+    shm_size: "128G"
+benchmarks:
+  - type: sglang_bench_serve
+    record_metrics: true
+    args:
+      backend: vllm
+      dataset-name: random
+      host: localhost
+      port: 8000
+      model: amd/GLM-5.2-MXFP4
+      ready-check-timeout-sec: 7200
+      request-rate: inf
+      random-range-ratio: 0.8
+    sweep_config:
+      - {random-input-len: 1000, random-output-len: 1000, max-concurrency: 4, warmup-requests: 4, seed: 99, num-prompts: 16}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 4,   warmup-requests: 4,   seed: 1,  num-prompts: 32}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 8,   warmup-requests: 8,   seed: 5,  num-prompts: 64}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 16,  warmup-requests: 16,  seed: 9,  num-prompts: 96}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 32,  warmup-requests: 32,  seed: 13, num-prompts: 128}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 64,  warmup-requests: 64,  seed: 17, num-prompts: 256}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 128, warmup-requests: 128, seed: 21, num-prompts: 384}
+      - {random-input-len: 1024, random-output-len: 1024, max-concurrency: 256, warmup-requests: 256, seed: 25, num-prompts: 768}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 4,   warmup-requests: 4,   seed: 3,  num-prompts: 32}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 8,   warmup-requests: 8,   seed: 7,  num-prompts: 64}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 16,  warmup-requests: 16,  seed: 11, num-prompts: 96}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 32,  warmup-requests: 32,  seed: 15, num-prompts: 128}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 64,  warmup-requests: 64,  seed: 19, num-prompts: 256}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 128, warmup-requests: 128, seed: 23, num-prompts: 384}
+      - {random-input-len: 8192, random-output-len: 1024, max-concurrency: 256, warmup-requests: 256, seed: 27, num-prompts: 768}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 4,   warmup-requests: 4,   seed: 29, num-prompts: 32}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 8,   warmup-requests: 8,   seed: 30, num-prompts: 64}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 16,  warmup-requests: 16,  seed: 31, num-prompts: 96}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 32,  warmup-requests: 32,  seed: 32, num-prompts: 128}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 64,  warmup-requests: 64,  seed: 33, num-prompts: 256}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 128, warmup-requests: 128, seed: 34, num-prompts: 384}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 256, warmup-requests: 256, seed: 35, num-prompts: 768}
