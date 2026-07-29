@@ -365,3 +365,86 @@ The roughly seven duplicate routed expert tiles saved per dispatch did not
 repay even one workgroup barrier plus ballot/list setup executed by all 256
 routed candidate workgroups. The implementation is retained behind an explicit
 option for experimentation, but routed deduplication is disabled by default.
+
+## Next M=16 experiment: routed embedded sort plus grouped shared expert
+
+The M=16 target should combine the two successful ideas instead of choosing
+between them:
+
+1. Apply embedded expert compaction only to routed slots 0-7.
+2. Exclude deterministic shared slot 8 from candidate leader detection and
+   route scans.
+3. Process the shared expert as one grouped BM16 block in Stage 1.
+4. Use route-direct Stage 2 for the first eight routes and one grouped
+   shared-expert Stage-2 block with weight fixed to 1.0.
+
+This preserves duplicate routed-expert reuse, which matters at M=12/16, while
+removing duplicated shared-expert GEMM2 work and all shared-route sorting
+bookkeeping.
+
+For M=16, Stage 1 uses four N-dispatch groups:
+
+- Routed candidates: `16 * 8 * 4 = 512` workgroups
+- Shared grouped work: `4` workgroups
+
+The existing shared-hybrid Stage 2 can consume the resulting layout directly:
+`16 * 8 + 1` BM16 intermediate blocks.
+
+### Combined-path results
+
+| M | Main `f16in` (us) | Previous embedded sort (us) | Combined (us) |
+|---:|------------------:|----------------------------:|--------------:|
+| 12 | 77.78 | 73.43 | 68.24 |
+| 16 | 86.32 | 96.49 | 93.47-94.03 |
+
+The combined path is a clear M=12 win: about 12.3% faster than main and 7.1%
+faster than the previous embedded-sort path. At M=16 it improves the in-tree
+path by roughly 2.5-3 us, but remains about 8-9% behind main.
+
+### M=16 dispatch and cache tuning
+
+Routed Stage-1 N-dispatch groups:
+
+- One group: 107.74 us
+- Two groups: 93.47 us
+- Four groups: 94.56 us
+
+Two groups are selected for both M=12 and M=16.
+
+Cache-policy experiments around the two-group recipe:
+
+- Routed Stage 1 cached: approximately 106.50 us
+- Shared Stage 1 non-temporal: approximately 98.83 us
+- Routed Stage 2 non-temporal: approximately 96.65 us
+- Shared Stage 2 non-temporal: approximately 95.60 us
+- Both Stage-2 paths non-temporal: approximately 97.46 us
+
+The selected policy remains routed Stage 1 non-temporal, shared Stage 1
+cached, and both Stage-2 paths cached.
+
+### M=16 stage breakdown
+
+For the selected BN256/two-group combined path:
+
+- Stage 1: approximately 63.05 us
+- Stage 2: approximately 30.40 us
+
+The remaining gap to main is now primarily Stage 2. Main sorting reduces the
+128 routed rows to roughly 100-105 unique routed expert blocks, while the
+combined route-direct Stage 2 still launches all 128 routed rows.
+
+### Combined BN128 check
+
+At M=16:
+
+- BN256 with two routed N groups: approximately 93.47 us
+- BN128 with two routed N groups: approximately 94.27 us
+- BN128 with four routed N groups: approximately 93.07 us
+
+BN128/four groups is marginally faster in one run, but the difference is
+small enough to treat as a tie. BN256/two groups remains the simpler selected
+configuration.
+
+The next structural experiment is grouped routed Stage 2 that gathers
+route-private FP4 rows and scales for duplicate routed experts, while retaining
+the grouped deterministic shared-expert block.
