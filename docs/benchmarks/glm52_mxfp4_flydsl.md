@@ -448,3 +448,45 @@ configuration.
 The next structural experiment is grouped routed Stage 2 that gathers
 route-private FP4 rows and scales for duplicate routed experts, while retaining
 the grouped deterministic shared-expert block.
+
+## Sparse contiguous routed blocks plus grouped shared Stage 2
+
+A second combined path makes routed row ordering deterministic in Stage 1 and
+writes each leader expert to its sparse candidate BM16 block. Stage 1 publishes
+count, expert, token, and weight metadata once. Stage 2 checks the count before
+loading A, skips nonleaders, and runs the standard grouped routed epilogue.
+The shared expert remains the final grouped block with weight fixed to 1.0.
+
+### Results
+
+| M | Main `f16in` (us) | Prior combined (us) | Sparse-grouped selected (us) |
+|---:|------------------:|--------------------:|-----------------------------:|
+| 12 | 77.78 | 68.24 | 67.84 |
+| 16 | 86.32 | 93.47 | 91.21 |
+
+M=12 uses Stage-1 BN256 with two N groups. M=16 uses Stage-1 BN128 with
+four N groups.
+
+At M=16, the initial BN256/four-group result was approximately 92.20 us.
+BN128/four groups improved it to approximately 91.21 us. BN128 does not help
+M=12:
+
+- BN128/two groups: approximately 82.47 us
+- BN128/four groups: approximately 71.84 us
+- BN256/two groups: approximately 67.84 us
+
+### M=16 stage profile
+
+For BN256/four groups before the final BN128 switch:
+
+- Stage 1: approximately 62.31 us
+- Stage 2: approximately 28.11 us
+
+Grouped routed Stage 2 reduces Stage-2 time by about 2.3 us versus the
+route-direct combined path. The remaining gap is Stage 1 and the dynamic
+multi-row routed epilogue overhead.
+
+### Selected M=12/16 shared dispatch
+
+- M=12: sparse-grouped, Stage-1 BN256, two N groups
+- M=16: sparse-grouped, Stage-1 BN128, four N groups
