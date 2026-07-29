@@ -281,6 +281,20 @@ Normalized differences remained approximately `5e-6` to `1.3e-5`.
 BN128 already beats forced main at M=1/2/4, so BN64/K-wave2 and
 BN32/K-wave4 are now optional follow-up optimizations rather than blockers.
 
+### BN128 above M=4
+
+Shared-hybrid BN128 was also tested at larger token counts:
+
+| M | Hybrid BN128 (us) | Hybrid BN256 (us) | Selected path |
+|---:|------------------:|------------------:|:--------------|
+| 8 | 53.13 | 53.24 | Effectively tied; BN256 retained |
+| 12 | 77.15 | 76.35 | BN256 |
+| 16 | 98.82 | 103.14 | Embedded sort remains faster |
+
+BN128 improves the hybrid at M=16 but does not beat the existing embedded-sort
+path, and it provides no material M=8 benefit. Automatic BN128 selection
+therefore remains limited to M<=4.
+
 ## BN64 and BN32 completeness check
 
 BN64 was implemented for separated gate/up weights without K-wave splitting.
@@ -317,3 +331,37 @@ scale group, but that is equivalent to the tested BN64 workgroup shape.
 Therefore BN32 was not retained as a separate kernel variant.
 
 The selected low-M GEMM1 tile remains BN128 for M=1/2/4.
+
+## Next M=8 experiment: one-wave routed deduplication
+
+At shared M=8, the first eight routed slots contain exactly 64 route entries.
+They fit in one CDNA wave. A specialized Stage-1 candidate workgroup can:
+
+1. Load all 64 routed expert IDs with wave 0.
+2. Ballot matches against the candidate expert.
+3. Determine the leader from the lowest matching route.
+4. Use `mbcnt` to assign deterministic compact slots.
+5. Publish at most eight matching route IDs to an LDS list.
+6. Run GEMM1 only for the leader candidate.
+
+The other three waves wait at one workgroup barrier and then participate in
+GEMM1. This removes the full-route scans and LDS sorting atomics used by the
+general embedded-sort kernel while retaining duplicate routed-expert
+compaction. The deterministic shared expert remains a separate grouped block.
+
+This path is only intended for M<=8, where `(TOPK-1) * M <= 64`.
+
+### One-wave dedup result
+
+The wave-ballot implementation was numerically correct at shared M=8, but
+regressed latency:
+
+- Hybrid without routed dedup: approximately 52.5 us
+- Hybrid with one-wave routed dedup: approximately 54.7 us
+- Removing the route-list initialization barrier still measured approximately
+  54.9 us and did not recover the regression.
+
+The roughly seven duplicate routed expert tiles saved per dispatch did not
+repay even one workgroup barrier plus ballot/list setup executed by all 256
+routed candidate workgroups. The implementation is retained behind an explicit
+option for experimentation, but routed deduplication is disabled by default.

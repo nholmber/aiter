@@ -18,6 +18,7 @@ def _get_stage1(
     shared_use_nt,
     interleave,
     BN,
+    dedup_routed,
 ):
     from .kernels.mxfp4_shared_hybrid_moe import (
         compile_mxfp4_shared_hybrid_stage1,
@@ -32,6 +33,7 @@ def _get_stage1(
         shared_use_nt=shared_use_nt,
         interleave=interleave,
         BN=BN,
+        dedup_routed=dedup_routed,
     )
 
 
@@ -77,6 +79,7 @@ def flydsl_mxfp4_shared_hybrid_moe(
     stage2_shared_use_nt=False,
     shared_weight_is_one=True,
     interleave=False,
+    dedup_routed=None,
     stream=None,
 ):
     """Two-launch GLM-5.2 path with a deterministic final shared route.
@@ -102,6 +105,12 @@ def flydsl_mxfp4_shared_hybrid_moe(
         )
     if stage1_bn is None:
         stage1_bn = 128 if M <= 4 else 256
+    if dedup_routed is None:
+        dedup_routed = False
+    if dedup_routed and M * (TOPK - 1) > 64:
+        raise ValueError(
+            "wave routed dedup requires M * (TOPK - 1) <= 64"
+        )
 
     routed_topk = TOPK - 1
     max_m_blocks = M * routed_topk + 1
@@ -139,6 +148,7 @@ def flydsl_mxfp4_shared_hybrid_moe(
         stage1_shared_use_nt,
         interleave,
         stage1_bn,
+        dedup_routed,
     )
     _moe_kernels._run_compiled(
         stage1,

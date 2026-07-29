@@ -6,7 +6,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .mxfp4_gemm1 import _bm_constants, _gemm1_body, _global_i32_at
@@ -19,7 +19,9 @@ from .mxfp4_gemm2 import (
 from .mxfp4_gemm_common import (
     _buffer_rsrc,
     _gep1,
+    _gep3,
     _global_base_ptr1,
+    _lds_ptr3,
     _raw,
     k_half_for,
     k_tiles_total_for,
@@ -41,6 +43,7 @@ def compile_mxfp4_shared_hybrid_stage1(
     routed_use_nt=True,
     shared_use_nt=False,
     interleave=False,
+    dedup_routed=False,
 ):
     """Sparse routed GEMM1 plus one grouped shared-expert GEMM1."""
     if BM != 16 or BN not in (64, 128, 256) or BK != 256:
@@ -58,16 +61,21 @@ def compile_mxfp4_shared_hybrid_stage1(
     kh_tile = BK // 2
     n_out = 2 * D_INTER
     n_blocks = num_n_blocks_for(n_out, BN)
-    _, _, _, lds_bytes = _bm_constants(
+    _, _, _, body_lds_bytes = _bm_constants(
         BM, BN, kh_tile, k_tiles_total_for(D_HIDDEN, BK)
+    )
+    metadata_bytes = ((4 + BM * 4 + 15) // 16) * 16
+    lds_bytes = body_lds_bytes + (
+        metadata_bytes if dedup_routed else 0
     )
     gu_tag = "il" if interleave else "sep"
     rnt_tag = "nt" if routed_use_nt else "cached"
     snt_tag = "nt" if shared_use_nt else "cached"
     bn_tag = "" if BN == 256 else f"_bn{BN}"
+    dedup_tag = "_dedup" if dedup_routed else ""
     name = (
         f"mxfp4_shared_hybrid_g1_h{D_HIDDEN}_i{D_INTER}_ne{NE}_tk{TOPK}"
-        f"_bm{BM}_r{rnt_tag}_s{snt_tag}_{gu_tag}{bn_tag}_v1"
+        f"_bm{BM}_r{rnt_tag}_s{snt_tag}_{gu_tag}{bn_tag}{dedup_tag}_v1"
     )
 
     @fx.struct
@@ -158,35 +166,156 @@ def compile_mxfp4_shared_hybrid_stage1(
                 T.i32, _raw(_global_i32_at(arg_topk_ids, raw_route))
             )
             tile = route * fx.Int32(n_blocks) + n_block
-            _gemm1_body(
-                lds_raw_ptr,
-                arg_inter_q,
-                arg_inter_scale,
-                arg_w1,
-                arg_w1_scale,
-                arg_topk_ids,
-                arg_topk_ids,
-                arg_inter_q,
-                arg_inter_scale,
-                arg_hidden,
-                tile,
-                lane,
-                wave,
-                routed_use_nt,
-                i32_ntok,
-                max_m_blocks,
-                BM=BM,
-                BN=BN,
-                BK=BK,
-                inline_quant=True,
-                K=D_HIDDEN,
-                N_OUT=n_out,
-                NE=NE,
-                interleave=interleave,
-                direct_route=True,
-                direct_expert=expert,
-                direct_token=token,
-            )
+            if const_expr(dedup_routed):
+                metadata_base_i32 = (
+                    fx.Int32(fx.ptrtoint(lds_raw_ptr))
+                    + fx.Int32(body_lds_bytes)
+                )
+                lds_flag = _lds_ptr3(metadata_base_i32, fx.Int32(0))
+                lds_routes = _lds_ptr3(metadata_base_i32, fx.Int32(4))
+
+                if wave == fx.Int32(0):
+                    if lane < fx.Int32(BM):
+                        llvm.StoreOp(
+                            _raw(num_routed),
+                            _gep3(
+                                lds_routes, lane * fx.Int32(4)
+                            ),
+                            alignment=4,
+                        )
+                    routed_idx = lane
+                    valid = routed_idx < num_routed
+                    safe_idx = valid.select(routed_idx, fx.Int32(0))
+                    routed_token = safe_idx // fx.Int32(routed_topk)
+                    routed_slot = (
+                        safe_idx
+                        - routed_token * fx.Int32(routed_topk)
+                    )
+                    routed_raw = (
+                        routed_token * fx.Int32(TOPK) + routed_slot
+                    )
+                    lane_expert = _global_i32_at(
+                        arg_topk_ids, routed_raw
+                    )
+                    match = valid & (lane_expert == expert)
+                    mask = fx.Uint64(
+                        rocdl.ballot(T.i64, _raw(match))
+                    )
+                    mask_lo = fx.Int32(
+                        arith.trunci(T.i32, _raw(mask))
+                    )
+                    mask_hi = fx.Int32(
+                        arith.trunci(
+                            T.i32, _raw(mask >> fx.Uint64(32))
+                        )
+                    )
+                    rank = fx.Int32(
+                        rocdl.mbcnt_lo(
+                            T.i32,
+                            _raw(mask_lo),
+                            _raw(fx.Int32(0)),
+                        )
+                    )
+                    rank = fx.Int32(
+                        rocdl.mbcnt_hi(
+                            T.i32, _raw(mask_hi), _raw(rank)
+                        )
+                    )
+                    if match & (rank < fx.Int32(BM)):
+                        llvm.StoreOp(
+                            _raw(routed_idx),
+                            _gep3(
+                                lds_routes, rank * fx.Int32(4)
+                            ),
+                            alignment=4,
+                        )
+                    if lane == fx.Int32(0):
+                        lower = (
+                            (
+                                fx.Uint64(1) << fx.Uint64(route)
+                            )
+                            - fx.Uint64(1)
+                        )
+                        leader = (mask & lower) == fx.Uint64(0)
+                        llvm.StoreOp(
+                            _raw(
+                                leader.select(
+                                    fx.Int32(1), fx.Int32(0)
+                                )
+                            ),
+                            lds_flag,
+                            alignment=4,
+                        )
+                gpu.barrier()
+                is_leader = fx.Int32(
+                    rocdl.readfirstlane(
+                        T.i32, llvm.load(T.i32, lds_flag)
+                    )
+                ) == fx.Int32(1)
+                if is_leader:
+                    _gemm1_body(
+                        lds_raw_ptr,
+                        arg_inter_q,
+                        arg_inter_scale,
+                        arg_w1,
+                        arg_w1_scale,
+                        arg_topk_ids,
+                        arg_topk_ids,
+                        arg_inter_q,
+                        arg_inter_scale,
+                        arg_hidden,
+                        tile,
+                        lane,
+                        wave,
+                        routed_use_nt,
+                        i32_ntok,
+                        max_m_blocks,
+                        BM=BM,
+                        BN=BN,
+                        BK=BK,
+                        inline_quant=True,
+                        K=D_HIDDEN,
+                        N_OUT=n_out,
+                        NE=NE,
+                        interleave=interleave,
+                        direct_route=True,
+                        direct_expert=expert,
+                        direct_mapped_rows=True,
+                        mapped_output=True,
+                        output_row_limit=num_routed,
+                        local_route_map_ptr=lds_routes,
+                        local_route_topk=routed_topk,
+                    )
+            else:
+                _gemm1_body(
+                    lds_raw_ptr,
+                    arg_inter_q,
+                    arg_inter_scale,
+                    arg_w1,
+                    arg_w1_scale,
+                    arg_topk_ids,
+                    arg_topk_ids,
+                    arg_inter_q,
+                    arg_inter_scale,
+                    arg_hidden,
+                    tile,
+                    lane,
+                    wave,
+                    routed_use_nt,
+                    i32_ntok,
+                    max_m_blocks,
+                    BM=BM,
+                    BN=BN,
+                    BK=BK,
+                    inline_quant=True,
+                    K=D_HIDDEN,
+                    N_OUT=n_out,
+                    NE=NE,
+                    interleave=interleave,
+                    direct_route=True,
+                    direct_expert=expert,
+                    direct_token=token,
+                )
 
     @flyc.jit
     def launch_stage1(
