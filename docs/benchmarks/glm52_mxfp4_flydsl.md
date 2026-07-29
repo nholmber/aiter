@@ -755,6 +755,89 @@ Stage 1, so the next implementation should retain this grid while replacing
 the four serial bodies with one shared A quantization and four wave-native
 expert bodies.
 
+#### Wave-native shared-A implementation
+
+The routed Stage 1 now uses the validated token/phase grid with genuinely
+independent expert waves:
+
+- The four waves quantize disjoint K tiles of one BF16 token into shared LDS.
+- Each wave owns one routed expert and computes both gate and up columns.
+- Four-role batches limit live B fragments while retaining enough outstanding
+  memory operations to hide weight latency.
+- Only the live MFMA row is retained, activated, quantized to FP4, and written
+  to the original route-private intermediate block.
+- The packed A row is stored compactly; the other 15 MFMA rows are deliberately
+  undefined because their results are discarded.
+- The deterministic shared expert remains a grouped BM16 block with expert ID
+  256 and weight 1.0.
+
+The routed width is bucket-specific:
+
+- M<=8: BN64, cached W1 loads.
+- M>8: BN128, non-temporal W1 loads.
+
+The larger bucket also has a wave-native Stage 2. Its grid is
+`M * 2 phases * 24 N blocks`, plus 24 grouped shared-expert blocks. Each wave
+loads one route-private FP4 row, computes all 256 output columns in four-role
+batches, and atomically accumulates its weighted BF16 result. M<=8 retains the
+existing route-direct shared-hybrid Stage 2 because it is equally fast and has
+a more stable accumulation order.
+
+The selected same-process comparison against the forced latest-main path
+(adaptive auxiliary sort + BM16 `f16in` GEMM1 + BM16 atomic GEMM2) is:
+
+| Actual M | Token-wave (us) | Main `f16in` (us) | Delta |
+|---------:|----------------:|------------------:|------:|
+| 8  | 46.88 | 48.95 | -4.22% |
+| 12 | 66.52 | 75.17 | -11.50% |
+| 16 | 88.55 | 85.82 | +3.17% |
+
+Normalized differences were approximately:
+
+- M=8: `5.2e-6`
+- M=12: `1.23e-5`
+- M=16: `8.9e-6`
+
+The M=12 row is diagnostic: AITER still treats it as the M=16 production
+bucket. The same BN128/NT recipe is used at M=12 and M=16; it wins strongly at
+the former but remains behind at the full bucket.
+
+At M=16, a representative selected profile was:
+
+- Token-wave Stage 1: approximately 61.2 us
+- Token-wave Stage 2: approximately 28.6 us
+- Forced-main sort: approximately 4.3 us
+- Forced-main GEMM1: approximately 55.2 us
+- Forced-main GEMM2: approximately 26.9 us
+
+The remaining M=16 gap is routed duplicate reuse. Main pays for sorting but
+reduces roughly 128 routed rows to the distinct routed experts, while the
+token-centric path intentionally computes every route independently.
+
+Important tuning and negative results:
+
+- Compact A is neutral at M=8 and saves roughly 5 us in isolated M=16 Stage 1
+  versus the full 49 KiB row-padded LDS representation.
+- Cached W1 loads win at M=8; non-temporal W1 loads win in the real alternating
+  GEMM1/GEMM2 workload for M=12/16.
+- Shared-expert BN256 regresses Stage 1 by roughly 4 us; grouped shared BN64
+  remains selected.
+- Stage-1 BN128 role batches:
+  - batch 2: approximately 94.5 us end to end
+  - batch 4: approximately 89.1 us before the final Stage-2 change
+  - batch 8: approximately 89.4 us
+- Routed BN256 measured approximately 102.7 us and produced NaNs in part of
+  the output; it is disabled.
+- Wave-native Stage-2 cached batch 4 is selected. Batch 8 is slower and
+  non-temporal W2 loads regress to approximately 98.4 us.
+- Removing the non-temporal hint from FP4 intermediate stores was effectively
+  neutral within run-to-run variance.
+
+No tuning CSV row is enabled yet. A production integration should use the
+token-wave path for the small/intermediate actual-M cases where it wins and
+fall back to sorted `f16in` at the full M=16 bucket unless routed duplicate
+grouping is added.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave
