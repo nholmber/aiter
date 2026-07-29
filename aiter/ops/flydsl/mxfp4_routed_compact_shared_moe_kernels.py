@@ -45,6 +45,7 @@ def _get_stage2(
     TOPK,
     routed_use_nt,
     shared_use_nt,
+    dispatch_n_groups,
 ):
     from .kernels.mxfp4_routed_compact_shared_moe import (
         compile_mxfp4_routed_compact_shared_stage2,
@@ -57,6 +58,7 @@ def _get_stage2(
         TOPK=TOPK,
         routed_use_nt=routed_use_nt,
         shared_use_nt=shared_use_nt,
+        dispatch_n_groups=dispatch_n_groups,
     )
 
 
@@ -77,6 +79,7 @@ def flydsl_mxfp4_routed_compact_shared_moe(
     interleave=False,
     stage1_dispatch_n_groups=None,
     stage1_bn=None,
+    stage2_dispatch_n_groups=0,
     stream=None,
 ):
     """Sparse contiguous routed blocks plus one grouped shared block."""
@@ -182,6 +185,7 @@ def flydsl_mxfp4_routed_compact_shared_moe(
         TOPK,
         stage2_routed_use_nt,
         stage2_shared_use_nt,
+        stage2_dispatch_n_groups,
     )
     _moe_kernels._run_compiled(
         stage2,

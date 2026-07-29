@@ -450,6 +450,7 @@ def compile_mxfp4_routed_compact_shared_stage2(
     BK=256,
     routed_use_nt=False,
     shared_use_nt=False,
+    dispatch_n_groups=0,
 ):
     """Skip nonleader routed blocks and group the deterministic shared block."""
     if BM != 16 or BN != 256 or BK != 256:
@@ -459,6 +460,13 @@ def compile_mxfp4_routed_compact_shared_stage2(
     routed_topk = TOPK - 1
     kh_tile = BK // 2
     n_blocks = num_n_blocks_for(D_HIDDEN, BN)
+    if dispatch_n_groups == 0:
+        dispatch_n_groups = n_blocks
+    if dispatch_n_groups <= 0 or n_blocks % dispatch_n_groups != 0:
+        raise ValueError(
+            f"output N blocks ({n_blocks}) must be divisible by "
+            f"dispatch_n_groups ({dispatch_n_groups})"
+        )
     k_half = k_half_for(D_INTER)
     k_tiles = k_tiles_total_for(D_INTER, BK)
     a_stages = kStages if k_tiles <= kStages else 3
@@ -468,7 +476,8 @@ def compile_mxfp4_routed_compact_shared_stage2(
     snt_tag = "nt" if shared_use_nt else "cached"
     name = (
         f"mxfp4_routed_compact_shared_g2_h{D_HIDDEN}_i{D_INTER}"
-        f"_ne{NE}_tk{TOPK}_bm{BM}_r{rnt_tag}_s{snt_tag}_v1"
+        f"_ne{NE}_tk{TOPK}_bm{BM}_r{rnt_tag}_s{snt_tag}"
+        f"_ng{dispatch_n_groups}_v1"
     )
 
     @fx.struct
@@ -494,7 +503,7 @@ def compile_mxfp4_routed_compact_shared_stage2(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         num_routed = i32_ntok * fx.Int32(routed_topk)
-        routed_blocks = num_routed * fx.Int32(n_blocks)
+        routed_blocks = num_routed * fx.Int32(dispatch_n_groups)
         max_m_blocks = num_routed + fx.Int32(1)
         aq_records = fx.Int64(max_m_blocks) * fx.Int64(BM * k_half)
         aq_rsrc = _buffer_rsrc(arg_inter_q, aq_records)
@@ -505,8 +514,10 @@ def compile_mxfp4_routed_compact_shared_stage2(
         n_load_waves, rows_per_wave, k_subblocks = tiling(BM)
 
         if bx_i32 < routed_blocks:
-            route0 = bx_i32 // fx.Int32(n_blocks)
-            n_block = bx_i32 - route0 * fx.Int32(n_blocks)
+            route0 = bx_i32 // fx.Int32(dispatch_n_groups)
+            n_group = (
+                bx_i32 - route0 * fx.Int32(dispatch_n_groups)
+            )
             count = fx.Int32(
                 llvm.load(
                     T.i32,
@@ -540,37 +551,44 @@ def compile_mxfp4_routed_compact_shared_stage2(
                                 k_half=k_half,
                             )
                 rocdl.sched_barrier(0)
-                tile = route0 * fx.Int32(n_blocks) + n_block
-                _gemm2_body(
-                    lds_raw_ptr,
-                    arg_inter_scale,
-                    arg_w2,
-                    arg_w2_scale,
-                    arg_expert_ids,
-                    arg_sorted_token_ids,
-                    arg_sorted_weights,
-                    i32_ntok,
-                    max_m_blocks,
-                    arg_out,
-                    arg_inter_scale,
-                    tile,
-                    lane,
-                    wave,
-                    BM,
-                    routed_use_nt,
-                    NE,
-                    D_HIDDEN,
-                    "atomic",
-                    aq_rsrc=aq_rsrc,
-                    D_INTER=D_INTER,
-                    D_INTER_REAL=D_INTER,
-                    aStages=a_stages,
-                    BN=BN,
-                    BK=BK,
-                    KH_TILE=kh_tile,
-                )
+                for pass_idx in range_constexpr(
+                    n_blocks // dispatch_n_groups
+                ):
+                    n_block = n_group + fx.Int32(
+                        pass_idx * dispatch_n_groups
+                    )
+                    tile = route0 * fx.Int32(n_blocks) + n_block
+                    _gemm2_body(
+                        lds_raw_ptr,
+                        arg_inter_scale,
+                        arg_w2,
+                        arg_w2_scale,
+                        arg_expert_ids,
+                        arg_sorted_token_ids,
+                        arg_sorted_weights,
+                        i32_ntok,
+                        max_m_blocks,
+                        arg_out,
+                        arg_inter_scale,
+                        tile,
+                        lane,
+                        wave,
+                        BM,
+                        routed_use_nt,
+                        NE,
+                        D_HIDDEN,
+                        "atomic",
+                        aq_rsrc=aq_rsrc,
+                        D_INTER=D_INTER,
+                        D_INTER_REAL=D_INTER,
+                        aStages=a_stages,
+                        BN=BN,
+                        BK=BK,
+                        KH_TILE=kh_tile,
+                    )
+                    gpu.barrier()
         else:
-            n_block = bx_i32 - routed_blocks
+            n_group = bx_i32 - routed_blocks
             m_block = num_routed
             m_row = m_block * fx.Int32(BM)
             if wave < fx.Int32(n_load_waves):
@@ -594,41 +612,48 @@ def compile_mxfp4_routed_compact_shared_stage2(
                             k_half=k_half,
                         )
             rocdl.sched_barrier(0)
-            tile = m_block * fx.Int32(n_blocks) + n_block
-            _gemm2_body(
-                lds_raw_ptr,
-                arg_inter_scale,
-                arg_w2,
-                arg_w2_scale,
-                arg_expert_ids,
-                arg_sorted_token_ids,
-                arg_topk_weights,
-                i32_ntok,
-                max_m_blocks,
-                arg_out,
-                arg_inter_scale,
-                tile,
-                lane,
-                wave,
-                BM,
-                shared_use_nt,
-                NE,
-                D_HIDDEN,
-                "atomic",
-                aq_rsrc=aq_rsrc,
-                D_INTER=D_INTER,
-                D_INTER_REAL=D_INTER,
-                aStages=a_stages,
-                BN=BN,
-                BK=BK,
-                KH_TILE=kh_tile,
-                direct_route=True,
-                direct_expert=fx.Int32(NE - 1),
-                direct_sequential_rows=True,
-                direct_weight_stride=TOPK,
-                direct_weight_col=TOPK - 1,
-                direct_sequential_weight_one=True,
-            )
+            for pass_idx in range_constexpr(
+                n_blocks // dispatch_n_groups
+            ):
+                n_block = n_group + fx.Int32(
+                    pass_idx * dispatch_n_groups
+                )
+                tile = m_block * fx.Int32(n_blocks) + n_block
+                _gemm2_body(
+                    lds_raw_ptr,
+                    arg_inter_scale,
+                    arg_w2,
+                    arg_w2_scale,
+                    arg_expert_ids,
+                    arg_sorted_token_ids,
+                    arg_topk_weights,
+                    i32_ntok,
+                    max_m_blocks,
+                    arg_out,
+                    arg_inter_scale,
+                    tile,
+                    lane,
+                    wave,
+                    BM,
+                    shared_use_nt,
+                    NE,
+                    D_HIDDEN,
+                    "atomic",
+                    aq_rsrc=aq_rsrc,
+                    D_INTER=D_INTER,
+                    D_INTER_REAL=D_INTER,
+                    aStages=a_stages,
+                    BN=BN,
+                    BK=BK,
+                    KH_TILE=kh_tile,
+                    direct_route=True,
+                    direct_expert=fx.Int32(NE - 1),
+                    direct_sequential_rows=True,
+                    direct_weight_stride=TOPK,
+                    direct_weight_col=TOPK - 1,
+                    direct_sequential_weight_one=True,
+                )
+                gpu.barrier()
 
     @flyc.jit
     def launch_stage2(
@@ -647,8 +672,8 @@ def compile_mxfp4_routed_compact_shared_stage2(
     ):
         grid_x = (
             arith.index_cast(T.index, _raw(i32_ntok))
-            * fx.Index(routed_topk * n_blocks)
-            + fx.Index(n_blocks)
+            * fx.Index(routed_topk * dispatch_n_groups)
+            + fx.Index(dispatch_n_groups)
         )
         stage2_kernel(
             arg_inter_q,

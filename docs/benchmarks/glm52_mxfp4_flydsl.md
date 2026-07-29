@@ -490,3 +490,43 @@ multi-row routed epilogue overhead.
 
 - M=12: sparse-grouped, Stage-1 BN256, two N groups
 - M=16: sparse-grouped, Stage-1 BN128, four N groups
+
+### Stage-2 N-grouping result
+
+Reusing one loaded A block across multiple output N tiles did not improve
+M=16:
+
+| Stage-2 N groups | Total latency (us) |
+|-----------------:|-------------------:|
+| 24 | 91.23 |
+| 12 | 92.32 |
+| 8 | 91.77 |
+| 6 | 92.30 |
+| 4 | 94.54 |
+
+The saved A loads and count checks do not compensate for reduced N parallelism
+and the larger serial body. The default remains one workgroup per output
+N tile.
+
+## Next structural M=16 idea: persistent fused-sort Stage 1
+
+Candidate-local compaction is now the dominant Stage-1 overhead. A persistent
+Stage-1 kernel could embed sorting once:
+
+1. Launch at most one resident workgroup per CU.
+2. One designated workgroup initializes workspace and builds routed expert
+   metadata once.
+3. Publish a ready flag after a device-scope fence.
+4. Other resident workgroups wait for readiness.
+5. All workgroups pull compact `(expert block, N tile)` tasks from a global
+   atomic work queue.
+6. Keep the deterministic shared expert as explicit grouped work.
+
+This would approximate the separate adaptive-sort plus compact GEMM pipeline
+while retaining two external launches. It also creates an opportunity to
+quantize each token once into shared/global workspace instead of repeating
+inline quantization across every routed expert/N tile.
+
+The main risks are software grid synchronization, workspace epoch/reset
+handling, and ensuring the designated sorter workgroup is resident to avoid
+deadlock.
