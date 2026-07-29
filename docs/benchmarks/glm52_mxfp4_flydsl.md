@@ -560,3 +560,44 @@ The prototype code was removed. If persistence is revisited, it should use the
 existing all-block arrival/last-arriver barrier pattern from
 `moe_fused_route_quant_scatter.py`, where all workgroups participate in the
 counting phase and the last arriver performs only the prefix/dispatch step.
+
+### All-block last-arriver prototype result
+
+The recommended all-block pattern was also implemented:
+
+1. A zeroed workspace initializes two arrival/release barriers.
+2. All blocks clear and count routed experts.
+3. The last arriving block builds dense routed metadata.
+4. All blocks consume GEMM1 tasks from an atomic queue.
+
+Results at shared M=16:
+
+| Workers | Latency (us) | Correct |
+|--------:|-------------:|:--------|
+| 256 | ~273 | Yes |
+| 128 | ~217 | Yes |
+
+This is faster than the block-0 sorter prototype but still more than 2x slower
+than the ~91 us sparse-grouped kernel. The two grid barriers, metadata
+construction, global queue atomics, and persistent task loop overwhelm the
+approximately 3 us adaptive sort that the kernel is intended to eliminate.
+
+The all-block persistent prototype code was removed. Persistence is not a
+promising direction for this low-token shape.
+
+The next fundamental experiment should accept the separate adaptive sort and
+test a sorted BN128 `f16in` GEMM1. The three-launch structure may still beat the
+current main BN256 pipeline because sorting is cheap and BN128 materially
+improves low-M GEMM1.
+
+### Sorted BN128 M=16 result
+
+The separate adaptive-sort pipeline was tested with only GEMM1 changed from
+BN256 to BN128:
+
+- Main sorted BN256 `f16in`: approximately 88.57 us
+- Sorted BN128 `f16in`: approximately 91.99 us
+
+BN128 helps sparse route-direct layouts but regresses the dense sorted M=16
+pipeline. Main's BN256 GEMM1 remains the correct tile once expert rows are
+already compacted.
