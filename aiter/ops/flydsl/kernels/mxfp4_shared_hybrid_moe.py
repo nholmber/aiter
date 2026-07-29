@@ -43,13 +43,13 @@ def compile_mxfp4_shared_hybrid_stage1(
     interleave=False,
 ):
     """Sparse routed GEMM1 plus one grouped shared-expert GEMM1."""
-    if BM != 16 or BN not in (128, 256) or BK != 256:
+    if BM != 16 or BN not in (64, 128, 256) or BK != 256:
         raise ValueError(
-            "shared-hybrid Stage 1 requires BM=16, BN in {128,256}, and BK=256"
+            "shared-hybrid Stage 1 requires BM=16, BN in {64,128,256}, and BK=256"
         )
-    if BN == 128 and interleave:
+    if BN in (64, 128) and interleave:
         raise ValueError(
-            "shared-hybrid Stage-1 BN128 supports separated gate/up only"
+            "shared-hybrid Stage-1 BN64/BN128 supports separated gate/up only"
         )
     if TOPK < 2:
         raise ValueError("shared-hybrid Stage 1 requires TOPK >= 2")

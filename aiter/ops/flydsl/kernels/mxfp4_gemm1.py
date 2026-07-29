@@ -188,7 +188,7 @@ def _gemm1_body(
 
     BN_INT = BN // 2
     NWAVES = 4
-    NJ = (BN // NWAVES) // 16
+    NJ = max(1, (BN // NWAVES) // 16)
     N_COL_GROUPS = BN // 16
     N_SCALE_GROUPS = BN // 64
     b_aux = 2 if use_nt else 0
@@ -312,7 +312,16 @@ def _gemm1_body(
     N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(NJ):
-        if const_expr(interleave):
+        if const_expr(BN == 64):
+            role = wave
+            is_up = role & fx.Int32(1)
+            logical_chunk = role // fx.Int32(2)
+            logical_col = (
+                n_block_idx * fx.Int32(BN_INT)
+                + logical_chunk * fx.Int32(16)
+            )
+            col = is_up * fx.Int32(N_OUT // 2) + logical_col
+        elif const_expr(interleave):
             col = (
                 n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
             )
@@ -329,7 +338,17 @@ def _gemm1_body(
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
-    if const_expr(interleave):
+    if const_expr(BN == 64):
+        role = wave
+        is_up = role & fx.Int32(1)
+        logical_chunk = role // fx.Int32(2)
+        logical_col16 = (
+            n_block_idx * fx.Int32(BN_INT // 16) + logical_chunk
+        )
+        np_gate = logical_col16 // fx.Int32(2)
+        np_selected = np_gate + is_up * fx.Int32(N_OUT // 64)
+        np_list = [np_selected, np_selected]
+    elif const_expr(interleave):
         mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
         np_list = [mni_base, mni_base + fx.Int32(1)]
     else:
@@ -591,12 +610,22 @@ def _gemm1_body(
     zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
-        if const_expr(not interleave and BN == 128):
+        if const_expr(not interleave and BN in (64, 128)):
             if const_expr(BM != 16):
-                raise AssertionError("BN128 currently requires BM16")
-            sb = bs_slot[J]
+                raise AssertionError("BN64/BN128 currently require BM16")
+            mni = J if BN == 128 else 0
+            sb = bs_slot[mni]
             bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
             sa = a_scale[0]
+            if const_expr(BN == 64):
+                logical_chunk = wave // fx.Int32(2)
+                logical_col16 = (
+                    n_block_idx * fx.Int32(BN_INT // 16)
+                    + logical_chunk
+                )
+                pack_half = logical_col16 & fx.Int32(1)
+            else:
+                pack_half = wave & fx.Int32(1)
 
             def _bn128_mfma(in_b):
                 c = zero4 if const_expr(init) else accm[0][J]
@@ -609,9 +638,7 @@ def _gemm1_body(
                     [a[0][1], bJ1, c, 4, 4, 2, sa, 2 + in_b, sb],
                 )
 
-            even_wave = _raw(
-                (wave & fx.Int32(1)) == fx.Int32(0)
-            )
+            even_wave = _raw(pack_half == fx.Int32(0))
             wave_if = scf.IfOp(
                 even_wave, results_=[mfma_ty], has_else=True
             )
@@ -803,17 +830,30 @@ def _gemm1_body(
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
         for J in range_constexpr(NJ):
-            is_up = (J % 2) == 1
-            J_local = J // 2
-            gate_span = BN_INT // NWAVES
-            col_local = (
-                wave * fx.Int32(gate_span)
-                + fx.Int32(J_local * 16)
-                + lane_mod_16
-            )
-            lds_col = (
-                fx.Int32(BN_INT) + col_local
-            ) if is_up else col_local
+            if const_expr(BN == 64):
+                role = wave
+                is_up = role & fx.Int32(1)
+                col_local = (
+                    role // fx.Int32(2) * fx.Int32(16)
+                    + lane_mod_16
+                )
+            else:
+                is_up = (J % 2) == 1
+                J_local = J // 2
+                gate_span = BN_INT // NWAVES
+                col_local = (
+                    wave * fx.Int32(gate_span)
+                    + fx.Int32(J_local * 16)
+                    + lane_mod_16
+                )
+            if const_expr(BN == 64):
+                lds_col = (is_up != fx.Int32(0)).select(
+                    fx.Int32(BN_INT) + col_local, col_local
+                )
+            else:
+                lds_col = (
+                    fx.Int32(BN_INT) + col_local
+                ) if is_up else col_local
             vec = fx.Vector(accm[i][J])
             for v in range_constexpr(4):
                 idx = acc_idx(row_base + fx.Int32(v), lds_col)
@@ -981,11 +1021,11 @@ def compile_gemm1_a4w4_port(
             f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
 
-    assert BN in (128, 256) and BK == 256, (
-        f"only BN in {{128,256}} and BK=256 supported, got BN={BN} BK={BK}"
+    assert BN in (64, 128, 256) and BK == 256, (
+        f"only BN in {{64,128,256}} and BK=256 supported, got BN={BN} BK={BK}"
     )
-    if BN == 128 and interleave:
-        raise AssertionError("BN128 currently supports separated gate/up only")
+    if BN in (64, 128) and interleave:
+        raise AssertionError("BN64/BN128 currently support separated gate/up only")
     KH_TILE = BK // 2
     _K = D_HIDDEN
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"

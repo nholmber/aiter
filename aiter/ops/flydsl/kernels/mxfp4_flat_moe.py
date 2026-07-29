@@ -46,12 +46,14 @@ def compile_mxfp4_flat_stage1(
     use_nt: bool = True,
     interleave: bool = False,
 ):
-    if BM != 16 or BN not in (128, 256) or BK != 256:
+    if BM != 16 or BN not in (64, 128, 256) or BK != 256:
         raise ValueError(
-            "flat Stage 1 requires BM=16, BN in {128,256}, and BK=256"
+            "flat Stage 1 requires BM=16, BN in {64,128,256}, and BK=256"
         )
-    if BN == 128 and interleave:
-        raise ValueError("flat Stage-1 BN128 supports separated gate/up only")
+    if BN in (64, 128) and interleave:
+        raise ValueError(
+            "flat Stage-1 BN64/BN128 supports separated gate/up only"
+        )
 
     kh_tile = BK // 2
     n_out = 2 * D_INTER

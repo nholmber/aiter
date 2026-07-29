@@ -280,3 +280,40 @@ Normalized differences remained approximately `5e-6` to `1.3e-5`.
 
 BN128 already beats forced main at M=1/2/4, so BN64/K-wave2 and
 BN32/K-wave4 are now optional follow-up optimizations rather than blockers.
+
+## BN64 and BN32 completeness check
+
+BN64 was implemented for separated gate/up weights without K-wave splitting.
+The four waves take fixed roles:
+
+- Wave 0: gate columns 0-15
+- Wave 1: up columns 0-15
+- Wave 2: gate columns 16-31
+- Wave 3: up columns 16-31
+
+As with BN128, an explicit result-producing `scf.IfOp` selects the required
+low/high 16-row MFMA `opselB` half.
+
+### Shared-expert results
+
+| M | Flat BN128 (us) | Flat BN64 (us) | Hybrid BN128 (us) | Hybrid BN64 (us) |
+|---:|----------------:|---------------:|------------------:|-----------------:|
+| 1 | 19.84 | 19.89 | 20.60 | 21.82 |
+| 2 | 21.87 | 25.63 | 22.99 | 24.67 |
+
+BN64 is effectively tied with BN128 for flat M=1 and clearly regresses M=2.
+It is retained as a correctness-tested variant but is not selected
+automatically.
+
+### Why BN32 was not emitted as an independent workgroup tile
+
+A raw BN32 gate/up tile produces only 16 logical SiLU-times-up values. MXFP4
+requires one e8m0 scale for a complete group of 32 values. Two independent
+BN32 workgroups cannot form that scale without cross-workgroup communication
+or a subsequent reduction.
+
+Pairing two BN32 subtiles inside one workgroup restores a complete 32-value
+scale group, but that is equivalent to the tested BN64 workgroup shape.
+Therefore BN32 was not retained as a separate kernel variant.
+
+The selected low-M GEMM1 tile remains BN128 for M=1/2/4.
