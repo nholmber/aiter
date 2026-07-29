@@ -604,6 +604,19 @@ already compacted.
 
 ## Remaining longshot directions
 
+### Production token buckets
+
+AITER kernel selection rounds the runtime token count up to a power-of-two
+bucket. Measurements at intermediate values are diagnostic and do not imply a
+separate production kernel row. Follow-up tuning should report both:
+
+- The actual runtime token count used by the benchmark.
+- The power-of-two kernel bucket selected by AITER.
+
+In particular, M=12 exercises the M=16 selection bucket. Comparisons must
+force or report the kernel selected for that bucket rather than treating M=12
+as an independently tuned production point.
+
 ### 1. Fused sort plus one-time input quantization
 
 Quantize each BF16 token once, then reuse the FP4 activation and e8m0 scales
@@ -625,6 +638,23 @@ Risks:
 
 This is the lowest-risk remaining experiment.
 
+#### Quant-once M=16 result
+
+The complete conventional pipeline was measured with BM32 prequantized GEMM1:
+
+- Main `f16in`: approximately 89.0 us
+- Quant-once with cached GEMM1: approximately 116.7-119.3 us
+- Quant-once with non-temporal GEMM1: approximately 103.8-106.1 us
+
+The valid BM32 preparation path selected Opus sorting:
+
+- BM32 sort: approximately 13.7 us
+- BM32 sort plus MXFP4 quant/scale shuffle: approximately 18.5 us
+
+Forcing the adaptive BM32 auxiliary sort in the direct prequantized wiring
+still measured roughly 14.5 us and produced an incompatible layout/output in
+that prototype. Quant-once is therefore not competitive for the M=16 bucket.
+
 ### 2. Token-centric multi-expert GEMM1
 
 Dispatch one workgroup around a token/N tile instead of an expert/N tile.
@@ -643,6 +673,22 @@ Risks:
 - Register pressure and long-lived LDS A tiles may reduce occupancy.
 
 This is the highest-upside two-launch design, but requires a new GEMM1 body.
+
+#### Proposed token-centric mapping
+
+For each token:
+
+- Two expert phases cover the eight routed experts.
+- Four waves each own one expert within a phase.
+- Sixteen logical-N chunks cover the 512 intermediate values at 32 values per
+  chunk.
+- Grid size is `M * 2 * 16`: 256 workgroups at M=8 and 512 at M=16.
+- The token is quantized once into LDS and reused by all four expert waves.
+- Each wave performs its own gate/up MFMA sequence and writes one
+  route-private 32-value FP4 chunk plus one complete MX scale group.
+
+This avoids the cross-workgroup FP4 scale problem that made BN32 invalid:
+each wave emits a complete 32-value logical chunk (raw gate/up width 64).
 
 ### 3. Multi-route wave-specialized workgroups
 
@@ -671,3 +717,20 @@ and persistent Stage 2.
 
 This does not create a new fused kernel, but it is more likely to improve the
 production M=16 result than further candidate-local sorting work.
+
+#### Shared-routing `f16in` sweep result
+
+At M=16 shared:
+
+- BM16 atomic cached: approximately 88.54 us
+- BM16 atomic non-temporal: approximately 91.51 us
+- BM32 cshuffle: approximately 110.83 us
+- Forced BM32 atomic combinations were numerically invalid in this wiring
+
+Lower-level XCD swizzles produced only noise-level changes:
+
+- Best observed: GEMM1 XCD=2 at approximately 88.33 us
+- Baseline XCD=0: approximately 88.64 us
+
+The existing BM16 atomic cached main configuration remains the best supported
+`f16in` recipe under deterministic shared routing.
