@@ -1,0 +1,55 @@
+{
+  "annotations": [
+    {
+      "id": "f16-g2-more-wave-overlap",
+      "severity": "info",
+      "title": "Sorted GEMM2 sustains up to five overlapping waves per SIMD",
+      "note": "The traced target WGP reaches five wave slots per SIMD, compared with three for token-wave GEMM2. Active waves average 18.9k cycles versus 48.8k for token-wave. The sorted grid contains many quickly rejected blocks, but its active expert blocks carry less work per wave and expose more scheduling parallelism.",
+      "category": "comparison",
+      "confidence": 0.94,
+      "metric": 5,
+      "anchor": null
+    },
+    {
+      "id": "f16-g2-less-traffic",
+      "severity": "info",
+      "title": "Sorting cuts GEMM2 L2 requests by 15.9%",
+      "note": "The sorted path issues 1.478M TCC requests versus 1.758M for token-wave and records 1.388M misses versus 1.509M. Its lower hit rate is less important than avoiding duplicate routed-expert blocks.",
+      "category": "comparison",
+      "confidence": 0.96,
+      "metric": 279438,
+      "anchor": null
+    },
+    {
+      "id": "f16-g2-barrier-atomic",
+      "severity": "high",
+      "title": "Baseline GEMM2 pays heavy barrier and atomic stalls",
+      "note": "The three active barriers at idx 111, 130, and 181 accumulate about 105.6k stall cycles, while atomics at idx 200/205/210/215 add about 17.4k. Main still wins because compacted expert blocks reduce total route work and its 44-VGPR kernel supports more wave overlap.",
+      "category": "baseline-overhead",
+      "confidence": 0.93,
+      "suggestion": "These are upstream optimization opportunities; token-wave's atomic pair is already cheaper and is not its primary bottleneck.",
+      "metric": 122628,
+      "anchor": {
+        "instIdxs": [
+          111,
+          130,
+          181,
+          200,
+          205,
+          210,
+          215
+        ]
+      }
+    },
+    {
+      "id": "f16-g2-lds-conflicts",
+      "severity": "medium",
+      "title": "Sorted GEMM2 has a 63.7% LDS conflict ratio",
+      "note": "PMC records 310,272 bank conflicts and 796,992 LDS index-active events, a 63.7% conflict ratio under WaveScope's metric. Token-wave GEMM2 is only 1.61%. The baseline wins despite this, reinforcing that work reduction and latency hiding dominate the comparison.",
+      "category": "lds",
+      "confidence": 0.9,
+      "metric": 6375,
+      "anchor": null
+    }
+  ]
+}

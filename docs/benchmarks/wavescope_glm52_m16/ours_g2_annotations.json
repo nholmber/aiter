@@ -1,0 +1,125 @@
+{
+  "annotations": [
+    {
+      "id": "g2-memory-feed-dominates",
+      "severity": "critical",
+      "title": "Token-wave GEMM2 spends 95.1% of wave time waiting or stalled",
+      "note": "Across the 12 traced routed waves, WAIT is 51.02% and STALL is 44.10%; EXEC is only 4.82%. The grid supplies about 3.09 workgroups per CU and the trace shows three overlapping waves per SIMD. That is not enough to cover the long scale and weight-load latency in this 64-VGPR kernel.",
+      "category": "occupancy-latency",
+      "confidence": 0.98,
+      "suggestion": "Reduce exposed per-wave latency first. A higher-workgroup-count mapping helps only if it also reduces the 16-role live state rather than duplicating the same memory work.",
+      "metric": 557220,
+      "anchor": {
+        "wave": {
+          "se": 0,
+          "sm": 2,
+          "slot": 2
+        },
+        "time": [
+          141836,
+          199316
+        ]
+      }
+    },
+    {
+      "id": "g2-scale-fanout-wait",
+      "severity": "critical",
+      "title": "Eight narrow scale loads gate the first MFMA for 2,952 cycles",
+      "note": "The first K tile loads the route A scale and eight strided B-scale dwords at idx 332 and 335-342, then begins the B payload loads. The wait at idx 367 blocks for 2,952 cycles before the first MFMA. Aggregate ATT cost at idx 367 is 25,480 cycles across the traced waves.",
+      "category": "scale-load-latency",
+      "confidence": 0.98,
+      "suggestion": "Prefetch both K tiles' A/B scales before entering the role loop, or issue K+1 scale loads during K's MFMA batches. The scale values are small and long-lived; spending a few more registers here is more attractive than widening the B-payload role batch.",
+      "metric": 25480,
+      "anchor": {
+        "instIdxs": [
+          332,
+          335,
+          336,
+          337,
+          338,
+          339,
+          340,
+          341,
+          342,
+          343,
+          367,
+          368
+        ],
+        "wave": {
+          "se": 0,
+          "sm": 2,
+          "slot": 2
+        },
+        "time": [
+          179300,
+          182424
+        ]
+      }
+    },
+    {
+      "id": "g2-role-wait-staircase",
+      "severity": "high",
+      "title": "Role batches repeatedly fall into vmcnt stair-step waits",
+      "note": "After the initial scale wait, each four-role batch issues payload loads and then consumes roles through vmcnt(8..2). The costly vmcnt(7)/vmcnt(3) points at idx 391, 415, 439, 498, 523, 531, 548, and 556 expose 356-2,992 cycles in the representative wave. MFMA instructions themselves have little stall; operand delivery is the limiter.",
+      "category": "mfma-feed",
+      "confidence": 0.96,
+      "suggestion": "Convert the batch loop to rolling prefetch. Issue the next role's two dwordx4 payload loads immediately after the current role's MFMA consumes its registers, maintaining four live roles while eliminating batch-boundary starvation.",
+      "metric": 2992,
+      "anchor": {
+        "instIdxs": [
+          379,
+          391,
+          392,
+          403,
+          415,
+          416,
+          427,
+          439,
+          440,
+          486,
+          498,
+          499,
+          510,
+          523,
+          524,
+          531,
+          532,
+          535,
+          548,
+          549,
+          541,
+          556,
+          557
+        ]
+      }
+    },
+    {
+      "id": "g2-extra-route-traffic",
+      "severity": "high",
+      "title": "Route-private GEMM2 issues 18.9% more L2 requests than sorted f16in",
+      "note": "PMC measured 1.758M TCC requests and 1.509M misses versus 1.478M requests and 1.388M misses for sorted f16in GEMM2. The token-wave hit rate is higher (14.1% versus 6.1%), but independent duplicate routes still create more total traffic.",
+      "category": "duplicate-route-traffic",
+      "confidence": 0.95,
+      "suggestion": "Treat this as the irreducible part of the no-sort design at full M=16. Keep sorted f16in as the production fallback unless a duplicate-aware intermediate layout is introduced.",
+      "metric": 279438,
+      "anchor": null
+    },
+    {
+      "id": "g2-atomic-lds-not-primary",
+      "severity": "info",
+      "title": "Atomic output and LDS conflicts are secondary",
+      "note": "The routed atomic pair at idx 595/598 accounts for about 9.1k aggregate stall cycles, and the final barrier at idx 580 accounts for 18.1k. Load plus waitcnt cost exceeds 503k cycles. LDS bank conflicts are only 1.61%. Optimizing atomics or LDS first cannot recover the observed gap.",
+      "category": "negative-evidence",
+      "confidence": 0.94,
+      "suggestion": "Focus on scale/payload prefetch and total route traffic before changing the atomic epilogue.",
+      "metric": 27224,
+      "anchor": {
+        "instIdxs": [
+          580,
+          595,
+          598
+        ]
+      }
+    }
+  ]
+}

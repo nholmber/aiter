@@ -838,6 +838,30 @@ token-wave path for the small/intermediate actual-M cases where it wins and
 fall back to sorted `f16in` at the full M=16 bucket unless routed duplicate
 grouping is added.
 
+### WaveScope/ATT M=16 bottleneck analysis
+
+A steady-state ATT and PMC comparison was captured for token-wave GEMM1/GEMM2
+and forced-main `f16in` GEMM1/GEMM2. The complete report and WaveScope
+annotation payloads are in
+`docs/benchmarks/wavescope_glm52_m16/README.md`.
+
+The main conclusions are:
+
+- Token-wave GEMM1 spends 88.35% of active wave time in WAIT and has only one
+  routed wave per SIMD because the routed grid is almost exactly one workgroup
+  per CU.
+- Four-role batches repeatedly expose 1.5-3.0k-cycle `vmcnt(7)` waits after
+  only one MFMA pair. A rolling four-role prefetch is the highest-priority
+  micro-optimization.
+- Token-wave GEMM2 spends 95.1% of wave time in WAIT+STALL. Its initial eight
+  narrow B-scale loads gate the first MFMA for approximately 2.95k cycles.
+- Token-wave issues 26.6% more GEMM1 TCC requests and 18.9% more GEMM2 TCC
+  requests than sorted `f16in`. This quantifies the irreducible duplicate-route
+  cost at full M=16.
+- Token-wave LDS conflict ratios are only 4.95%/1.61% for GEMM1/GEMM2, versus
+  44.4%/63.7% for the baseline. LDS layout and atomics are not the next
+  bottlenecks to pursue.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave

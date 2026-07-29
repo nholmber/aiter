@@ -1,0 +1,84 @@
+{
+  "annotations": [
+    {
+      "id": "g1-single-wave-wait",
+      "severity": "critical",
+      "title": "One wave per SIMD spends 88.4% of its lifetime in WAIT",
+      "note": "The four traced waves are one workgroup: one long wave on each SIMD, each lasting 105.6-105.7k cycles. Their timelines total 373,428 WAIT cycles out of 422,684 cycles (88.35%), with only 10.54% EXEC and 1.08% STALL. The routed grid is 256 workgroups plus 16 shared-expert workgroups, only 1.06 workgroups per CU, so there is no second routed wave available to hide VMEM latency.",
+      "category": "occupancy-latency",
+      "confidence": 0.98,
+      "suggestion": "Keep the BN128 work reduction, but overlap more VMEM within each wave. If dispatch is split to raise occupancy, it must avoid recreating the BN64 quantization/launch overhead already measured.",
+      "metric": 373428,
+      "anchor": {
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [
+          133460,
+          239148
+        ]
+      }
+    },
+    {
+      "id": "g1-role-batch-feed",
+      "severity": "critical",
+      "title": "Four-role batches expose 2.5-3.0k-cycle vmcnt waits",
+      "note": "At idx 3006, the wave executes one MFMA after the batch loads and then waits 2,500 cycles at vmcnt(7) before the next MFMA. The same pattern reaches 2,956 cycles at idx 3207. The load instructions themselves issue quickly; the latency is exposed because the next role is consumed before enough independent work has run.",
+      "category": "mfma-feed",
+      "confidence": 0.97,
+      "suggestion": "Use a rolling four-role pipeline: after role r is consumed, immediately reuse its registers to issue role r+4 while the remaining current-batch MFMAs execute. This preserves the successful four-role register footprint without waiting at each batch boundary.",
+      "metric": 2956,
+      "anchor": {
+        "instIdxs": [
+          2994,
+          3004,
+          3005,
+          3006,
+          3007,
+          3177,
+          3178,
+          3179,
+          3180,
+          3181,
+          3205,
+          3206,
+          3207,
+          3208
+        ],
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [
+          142020,
+          144560
+        ]
+      }
+    },
+    {
+      "id": "g1-extra-route-traffic",
+      "severity": "high",
+      "title": "Independent routes generate 26.6% more L2 requests than sorted f16in",
+      "note": "PMC measured 3.427M TCC requests and 2.869M misses for token-wave GEMM1 versus 2.707M requests and 2.657M misses for sorted f16in. Token-wave has the better hit rate (16.3% versus 1.8%), but sorting eliminates enough duplicate-expert work that main still moves less data. This is the structural part of the full-M=16 gap.",
+      "category": "duplicate-route-traffic",
+      "confidence": 0.96,
+      "suggestion": "At exact M=16, either retain the sorted fallback or add a hybrid duplicate-expert path. Micro-scheduling can reduce exposed latency, but cannot remove the extra routed weight traffic.",
+      "metric": 720359,
+      "anchor": null
+    },
+    {
+      "id": "g1-lds-not-primary",
+      "severity": "info",
+      "title": "Compact-A LDS is not the bottleneck",
+      "note": "SQ_LDS_BANK_CONFLICT is 16,896 against 358,400 LDS index-active events, about 4.95% by the WaveScope conflict ratio. Timeline STALL is only 1.08%. This is dramatically cleaner than the sorted baseline's LDS behavior, so more LDS-layout work is unlikely to close the M=16 gap.",
+      "category": "negative-evidence",
+      "confidence": 0.94,
+      "suggestion": "Prioritize VMEM software pipelining and duplicate-route reduction, not further compact-A or bank-layout changes.",
+      "metric": 495,
+      "anchor": null
+    }
+  ]
+}

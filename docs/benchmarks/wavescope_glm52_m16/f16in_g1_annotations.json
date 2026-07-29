@@ -1,0 +1,71 @@
+{
+  "annotations": [
+    {
+      "id": "f16-g1-shorter-active-wave",
+      "severity": "info",
+      "title": "Sorted f16in active waves finish in 68.6k cycles",
+      "note": "The four active waves average 68.6k cycles versus 105.7k for token-wave GEMM1. They still spend 56.7% in WAIT and 26.1% in STALL, but each workgroup computes one compacted expert block rather than four independent routed experts. The second resident wave per SIMD is a short rejected/empty candidate and exits after about 0.9k cycles.",
+      "category": "comparison",
+      "confidence": 0.95,
+      "metric": 68604,
+      "anchor": {
+        "wave": {
+          "se": 0,
+          "sm": 1,
+          "slot": 0
+        },
+        "time": [
+          142960,
+          211596
+        ]
+      }
+    },
+    {
+      "id": "f16-g1-vmem-waits",
+      "severity": "high",
+      "title": "f16in also has 2.5k-cycle K-feed waits",
+      "note": "At idx 635, the workgroup issues the next B fragments, executes one MFMA pair, and then waits 2,496 cycles at vmcnt(9). Similar wait blocks repeat throughout the unrolled K loop. Main wins through less total routed work and a denser pipeline, not because memory latency disappears.",
+      "category": "mfma-feed",
+      "confidence": 0.94,
+      "suggestion": "This remains an optimization opportunity for upstream f16in; deeper prefetching could move the baseline further.",
+      "metric": 2496,
+      "anchor": {
+        "instIdxs": [
+          529,
+          530,
+          535,
+          536,
+          541,
+          542,
+          547,
+          548,
+          633,
+          634,
+          635,
+          636
+        ]
+      }
+    },
+    {
+      "id": "f16-g1-less-traffic",
+      "severity": "info",
+      "title": "Sorting cuts GEMM1 L2 requests by 21.0%",
+      "note": "The sorted path issues 2.707M TCC requests versus 3.427M for token-wave. Its measured hit rate is only 1.8%, but it avoids enough duplicate routed-expert work to reduce total requests and misses. This quantifies the benefit that the no-sort kernel must overcome.",
+      "category": "comparison",
+      "confidence": 0.97,
+      "metric": 720359,
+      "anchor": null
+    },
+    {
+      "id": "f16-g1-lds-conflicts",
+      "severity": "medium",
+      "title": "Sorted GEMM1 has a 44.4% LDS conflict ratio",
+      "note": "SQ_LDS_BANK_CONFLICT is 310,272 against 1,008,384 LDS index-active events, a 44.4% conflict ratio under WaveScope's metric. The token-wave compact-A layout is much cleaner at 4.95%. This is a baseline weakness, but it is outweighed by sorted work reduction.",
+      "category": "lds",
+      "confidence": 0.9,
+      "suggestion": "An upstream LDS swizzle improvement could make f16in faster still; it does not explain token-wave's current loss.",
+      "metric": 4444,
+      "anchor": null
+    }
+  ]
+}
