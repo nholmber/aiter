@@ -638,6 +638,54 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    glm52_token_wave_enabled = (
+        os.environ.get("AITER_GLM52_TOKEN_WAVE", "0") == "1"
+    )
+    glm52_token_wave_min_m = int(
+        os.environ.get("AITER_GLM52_TOKEN_WAVE_MIN_M", "5")
+    )
+    glm52_token_wave_max_m = int(
+        os.environ.get("AITER_GLM52_TOKEN_WAVE_MAX_M", "16")
+    )
+    if (
+        glm52_token_wave_enabled
+        and glm52_token_wave_min_m <= M <= glm52_token_wave_max_m
+        and get_gfx() == "gfx950"
+        and E == 257
+        and model_dim == 6144
+        and inter_dim == 512
+        and topk == 9
+        and dtype == dtypes.bf16
+        and hidden_states.dtype == dtypes.bf16
+        and activation == ActivationType.Silu
+        and quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and isG1U1
+        and isShuffled
+        and gate_mode == GateMode.SEPARATED
+        and not doweight_stage1
+        and expert_mask is None
+        and bias1 is None
+        and bias2 is None
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and w1_scale is not None
+        and w2_scale is not None
+    ):
+        from aiter.ops.flydsl.mxfp4_token_wave_shared_moe_kernels import (
+            flydsl_mxfp4_token_wave_shared_moe,
+        )
+
+        return flydsl_mxfp4_token_wave_shared_moe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            topk_ids=topk_ids,
+            topk_weights=topk_weight,
+        )
+
     grouped_a8w4_out = None
     if is_flydsl_available():
         try:
