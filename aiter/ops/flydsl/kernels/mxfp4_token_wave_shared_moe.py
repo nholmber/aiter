@@ -69,6 +69,7 @@ def compile_mxfp4_token_wave_shared_stage1(
     routed_use_nt=False,
     shared_use_nt=False,
     compact_a=True,
+    compact_routes=False,
     shared_bn=64,
     role_batch_size=4,
 ):
@@ -126,10 +127,11 @@ def compile_mxfp4_token_wave_shared_stage1(
     rnt_tag = "nt" if routed_use_nt else "cached"
     snt_tag = "nt" if shared_use_nt else "cached"
     a_tag = "compacta" if compact_a else "fulla"
+    route_tag = "_rc" if compact_routes else ""
     name = (
         f"mxfp4_token_wave_shared_g1_h{D_HIDDEN}_i{D_INTER}"
         f"_ne{NE}_tk{TOPK}_bm{BM}_bn{BN}_r{rnt_tag}_s{snt_tag}"
-        f"_{a_tag}_sbn{shared_bn}_rb{role_batch_size}_v3"
+        f"_{a_tag}{route_tag}_sbn{shared_bn}_rb{role_batch_size}_v4"
     )
 
     @fx.struct
@@ -142,8 +144,13 @@ def compile_mxfp4_token_wave_shared_stage1(
         arg_w1: fx.Int64,
         arg_w1_scale: fx.Int64,
         arg_topk_ids: fx.Int64,
+        arg_topk_weights: fx.Int64,
         arg_inter_q: fx.Int64,
         arg_inter_scale: fx.Int64,
+        arg_sorted_token_ids: fx.Int64,
+        arg_sorted_weights: fx.Int64,
+        arg_expert_ids: fx.Int64,
+        arg_counts: fx.Int64,
         arg_final_out: fx.Int64,
         i32_ntok: fx.Int32,
     ):
@@ -179,6 +186,196 @@ def compile_mxfp4_token_wave_shared_stage1(
                 T.i32, _raw(_global_i32_at(arg_topk_ids, raw_route))
             )
             route = token * fx.Int32(routed_topk) + slot
+            compact_block = route
+            compact_row = fx.Int32(0)
+            route_count = fx.Int32(1)
+
+            if const_expr(compact_routes):
+                scan_idx0 = lane
+                scan_valid0 = scan_idx0 < num_routed
+                safe_idx0 = scan_valid0.select(
+                    scan_idx0, fx.Int32(0)
+                )
+                scan_token0 = safe_idx0 // fx.Int32(routed_topk)
+                scan_slot0 = (
+                    safe_idx0
+                    - scan_token0 * fx.Int32(routed_topk)
+                )
+                scan_raw0 = (
+                    scan_token0 * fx.Int32(TOPK) + scan_slot0
+                )
+                scan_expert0 = _global_i32_at(
+                    arg_topk_ids, scan_raw0
+                )
+                match0 = scan_valid0 & (scan_expert0 == expert)
+                before0 = match0 & (scan_idx0 < route)
+                match_mask0 = fx.Uint64(
+                    rocdl.ballot(T.i64, _raw(match0))
+                )
+                before_mask0 = fx.Uint64(
+                    rocdl.ballot(T.i64, _raw(before0))
+                )
+
+                scan_idx1 = lane + fx.Int32(64)
+                scan_valid1 = scan_idx1 < num_routed
+                safe_idx1 = scan_valid1.select(
+                    scan_idx1, fx.Int32(0)
+                )
+                scan_token1 = safe_idx1 // fx.Int32(routed_topk)
+                scan_slot1 = (
+                    safe_idx1
+                    - scan_token1 * fx.Int32(routed_topk)
+                )
+                scan_raw1 = (
+                    scan_token1 * fx.Int32(TOPK) + scan_slot1
+                )
+                scan_expert1 = _global_i32_at(
+                    arg_topk_ids, scan_raw1
+                )
+                match1 = scan_valid1 & (scan_expert1 == expert)
+                before1 = match1 & (scan_idx1 < route)
+                match_mask1 = fx.Uint64(
+                    rocdl.ballot(T.i64, _raw(match1))
+                )
+                before_mask1 = fx.Uint64(
+                    rocdl.ballot(T.i64, _raw(before1))
+                )
+
+                count0 = fx.Int32(
+                    arith.trunci(
+                        T.i32, llvm.intr_ctpop(_raw(match_mask0))
+                    )
+                )
+                count1 = fx.Int32(
+                    arith.trunci(
+                        T.i32, llvm.intr_ctpop(_raw(match_mask1))
+                    )
+                )
+                rank0 = fx.Int32(
+                    arith.trunci(
+                        T.i32, llvm.intr_ctpop(_raw(before_mask0))
+                    )
+                )
+                rank1 = fx.Int32(
+                    arith.trunci(
+                        T.i32, llvm.intr_ctpop(_raw(before_mask1))
+                    )
+                )
+                first0 = fx.Int32(
+                    arith.trunci(
+                        T.i32,
+                        llvm.intr_cttz(
+                            _raw(match_mask0),
+                            False,
+                        ),
+                    )
+                )
+                first1 = (
+                    fx.Int32(
+                        arith.trunci(
+                            T.i32,
+                            llvm.intr_cttz(
+                                _raw(match_mask1),
+                                False,
+                            ),
+                        )
+                    )
+                    + fx.Int32(64)
+                )
+                has_first0 = match_mask0 != fx.Uint64(0)
+                compact_block = fx.Int32(
+                    arith.select(
+                        _raw(has_first0),
+                        _raw(first0),
+                        _raw(first1),
+                    )
+                )
+                compact_row = rank0 + rank1
+                route_count = count0 + count1
+
+                if n_block == fx.Int32(0):
+                    if lane == fx.Int32(0):
+                        is_leader = compact_row == fx.Int32(0)
+                        llvm.StoreOp(
+                            _raw(expert),
+                            _gep1(
+                                _global_base_ptr1(arg_expert_ids),
+                                route * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+                        llvm.StoreOp(
+                            _raw(
+                                is_leader.select(
+                                    route_count, fx.Int32(0)
+                                )
+                            ),
+                            _gep1(
+                                _global_base_ptr1(arg_counts),
+                                route * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+                        compact_metadata_row = (
+                            compact_block * fx.Int32(BM)
+                            + compact_row
+                        )
+                        weight = fx.Float32(
+                            llvm.load(
+                                T.f32,
+                                _gep1(
+                                    _global_base_ptr1(
+                                        arg_topk_weights
+                                    ),
+                                    raw_route * fx.Int32(4),
+                                ),
+                                invariant=True,
+                            )
+                        )
+                        llvm.StoreOp(
+                            _raw(token),
+                            _gep1(
+                                _global_base_ptr1(
+                                    arg_sorted_token_ids
+                                ),
+                                compact_metadata_row * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+                        llvm.StoreOp(
+                            _raw(weight),
+                            _gep1(
+                                _global_base_ptr1(arg_sorted_weights),
+                                compact_metadata_row * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+                    if (
+                        (compact_row == fx.Int32(0))
+                        & (lane >= route_count)
+                        & (lane < fx.Int32(BM))
+                    ):
+                        pad_row = (
+                            compact_block * fx.Int32(BM) + lane
+                        )
+                        llvm.StoreOp(
+                            _raw(i32_ntok),
+                            _gep1(
+                                _global_base_ptr1(
+                                    arg_sorted_token_ids
+                                ),
+                                pad_row * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
+                        llvm.StoreOp(
+                            _raw(fx.Float32(0.0)),
+                            _gep1(
+                                _global_base_ptr1(arg_sorted_weights),
+                                pad_row * fx.Int32(4),
+                            ),
+                            alignment=4,
+                        )
 
             lds_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
             lds_base = _lds_ptr3(lds_base_i32, fx.Int32(0))
@@ -517,7 +714,9 @@ def compile_mxfp4_token_wave_shared_stage1(
                     )
 
                 out_q_base = _global_base_ptr1(arg_inter_q)
-                out_row = route * fx.Int32(BM)
+                out_row = (
+                    compact_block * fx.Int32(BM) + compact_row
+                )
                 q_byte = (
                     out_row * fx.Int32(D_INTER // 2)
                     + n_block * fx.Int32(BN // 4)
@@ -540,9 +739,10 @@ def compile_mxfp4_token_wave_shared_stage1(
                     ) & fx.Int32(1)
                     lane_grp = scale_group & fx.Int32(3)
                     scale_dword = (
-                        route * fx.Int32(out_as_per_chunk_dw)
+                        compact_block * fx.Int32(out_as_per_chunk_dw)
                         + ku * fx.Int32(64)
                         + lane_grp * fx.Int32(16)
+                        + compact_row
                     )
                     scale_byte = (
                         scale_dword * fx.Int32(4)
@@ -597,8 +797,13 @@ def compile_mxfp4_token_wave_shared_stage1(
         arg_w1: fx.Int64,
         arg_w1_scale: fx.Int64,
         arg_topk_ids: fx.Int64,
+        arg_topk_weights: fx.Int64,
         arg_inter_q: fx.Int64,
         arg_inter_scale: fx.Int64,
+        arg_sorted_token_ids: fx.Int64,
+        arg_sorted_weights: fx.Int64,
+        arg_expert_ids: fx.Int64,
+        arg_counts: fx.Int64,
         arg_final_out: fx.Int64,
         i32_ntok: fx.Int32,
         stream: fx.Stream,
@@ -613,8 +818,13 @@ def compile_mxfp4_token_wave_shared_stage1(
             arg_w1,
             arg_w1_scale,
             arg_topk_ids,
+            arg_topk_weights,
             arg_inter_q,
             arg_inter_scale,
+            arg_sorted_token_ids,
+            arg_sorted_weights,
+            arg_expert_ids,
+            arg_counts,
             arg_final_out,
             i32_ntok,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)

@@ -1,0 +1,55 @@
+{
+  "annotations": [
+    {
+      "id": "g2-grouped-traffic-fixed",
+      "severity": "info",
+      "title": "Grouped Stage 2 removes the route-private traffic excess",
+      "note": "PMC measures 1.447M TCC requests and 1.378M misses, down from 1.758M/1.509M for token-wave route-private GEMM2 and slightly below forced f16in at 1.478M/1.388M. The deterministic Stage-1 rank/leader mapping successfully restores duplicate-expert reuse.",
+      "category": "resolved-bottleneck",
+      "confidence": 0.99,
+      "metric": 310778,
+      "anchor": null
+    },
+    {
+      "id": "g2-grouped-wave-duration",
+      "severity": "info",
+      "title": "Grouped active waves average 20.3k cycles",
+      "note": "The active grouped waves average 20.35k cycles, close to forced f16in GEMM2's 18.89k and far below the 48.82k route-private token-wave waves. End-to-end Stage 2 is approximately 26.2 us.",
+      "category": "resolved-bottleneck",
+      "confidence": 0.96,
+      "metric": 20348,
+      "anchor": null
+    },
+    {
+      "id": "g2-grouped-barrier-tail",
+      "severity": "medium",
+      "title": "Grouped GEMM2 is now limited by barrier and final memory waits",
+      "note": "The largest aggregate costs are the final barrier at idx 482, the vmcnt(0) wait at idx 246, and barriers at idx 344/361. These are inherited from the grouped GEMM2 body, but the complete stage is already slightly faster than forced f16in GEMM2.",
+      "category": "secondary-overhead",
+      "confidence": 0.9,
+      "suggestion": "Do not prioritize this until GEMM1 is improved; even eliminating these costs cannot remove the current full-pipeline gap.",
+      "metric": 135428,
+      "anchor": {
+        "instIdxs": [
+          246,
+          304,
+          344,
+          361,
+          401,
+          448,
+          482
+        ]
+      }
+    },
+    {
+      "id": "g2-grouped-lds-conflicts",
+      "severity": "low",
+      "title": "Grouped GEMM2 inherits the baseline LDS conflict pattern",
+      "note": "The grouped kernel records the same 63.75% LDS conflict ratio as the baseline GEMM2 body. Despite that, its traffic and latency are competitive. This remains an upstream kernel opportunity, not the reason the token-wave pipeline trails at M=16.",
+      "category": "negative-evidence",
+      "confidence": 0.9,
+      "metric": 6375,
+      "anchor": null
+    }
+  ]
+}

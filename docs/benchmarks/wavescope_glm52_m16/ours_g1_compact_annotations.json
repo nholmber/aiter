@@ -1,0 +1,75 @@
+{
+  "annotations": [
+    {
+      "id": "g1-compact-single-wave-wait",
+      "severity": "critical",
+      "title": "Compacted GEMM1 still spends 88.4% of wave time in WAIT",
+      "note": "The deterministic route scan changes the output layout but not the GEMM1 feed bottleneck. The four waves average 113.0k cycles, with 88.36% WAIT, 10.34% EXEC, and 1.28% STALL. There is still only one routed workgroup per CU.",
+      "category": "occupancy-latency",
+      "confidence": 0.98,
+      "suggestion": "The remaining optimization target is the W1 payload pipeline or routed-expert work reduction. Stage-2 grouping has already removed the downstream duplicate traffic.",
+      "metric": 399440,
+      "anchor": {
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [
+          137864,
+          250896
+        ]
+      }
+    },
+    {
+      "id": "g1-compact-vmem-feed",
+      "severity": "critical",
+      "title": "vmcnt(7) waits remain the dominant GEMM1 instruction cost",
+      "note": "The largest wait blocks at idx 4369, 3308, 3923, and 3275 each accumulate 8.7-9.1k cycles across the four traced waves. Route compaction adds only a small scan; it does not change the four-role W1 load/MFMA schedule.",
+      "category": "mfma-feed",
+      "confidence": 0.97,
+      "suggestion": "Do not revisit the tested rolling-load forms: per-role rolling raised wave duration to 145.9k cycles, and next-batch overlap also regressed. A future pipeline needs asynchronous staging or a different W1 work decomposition.",
+      "metric": 9112,
+      "anchor": {
+        "instIdxs": [
+          3275,
+          3308,
+          3923,
+          4369
+        ]
+      }
+    },
+    {
+      "id": "g1-compact-scan-cost",
+      "severity": "medium",
+      "title": "Route scan adds about 7.3k cycles per traced wave",
+      "note": "The compact-output wave averages 113.0k cycles versus 105.7k for route-private GEMM1. The scan uses two coalesced routed-ID reads, ballots, popcounts, and first-bit selection. Device-level Stage 1 remains near 61-62 us because the added work is small relative to the W1 waits.",
+      "category": "compaction-overhead",
+      "confidence": 0.9,
+      "suggestion": "Keep the scan: it enables a roughly 2 us Stage-2 gain and improves numerical stability. Further scan tuning is lower priority than W1 traffic.",
+      "metric": 7349,
+      "anchor": {
+        "instIdxs": [
+          2558,
+          2559,
+          2560,
+          2585,
+          2586,
+          2594,
+          2595
+        ]
+      }
+    },
+    {
+      "id": "g1-compact-traffic-unchanged",
+      "severity": "high",
+      "title": "Compaction cannot remove GEMM1's 26.7% extra TCC requests",
+      "note": "PMC records 3.429M TCC requests and 2.879M misses, essentially unchanged from route-private token-wave GEMM1 and still above forced f16in's 2.707M requests and 2.657M misses. Every routed W1 projection is still computed independently.",
+      "category": "duplicate-route-traffic",
+      "confidence": 0.98,
+      "suggestion": "Closing exact M=16 now requires grouping duplicate experts in GEMM1 or retaining sorted f16in as the fallback. Stage-2-only work cannot erase this traffic.",
+      "metric": 722688,
+      "anchor": null
+    }
+  ]
+}

@@ -862,6 +862,36 @@ The main conclusions are:
   44.4%/63.7% for the baseline. LDS layout and atomics are not the next
   bottlenecks to pursue.
 
+#### Deterministic compact-route output
+
+Each token-wave route now computes its rank and first matching leader among the
+128 routed rows using two ballot/popcount scans. Stage 1 writes FP4 output
+directly to `leader_block * BM16 + rank` and publishes count/expert/token/weight
+metadata. This allows the existing grouped routed Stage 2 to be reused without
+an extra sort launch.
+
+Selected measurements:
+
+| Actual M | Compact/grouped (us) | Prior token-wave (us) | Main `f16in` (us) |
+|---:|---:|---:|---:|
+| 12 | 65.06 | 67.13 | 74.98 |
+| 16 | 86.48 | 88.66 | 84.09 |
+
+At M=16:
+
+- Compact-route Stage 1: approximately 61.5 us.
+- Grouped Stage 2: approximately 26.2 us.
+- Grouped Stage-2 TCC requests: 1.447M, versus 1.758M for the prior
+  route-private Stage 2 and 1.478M for forced `f16in`.
+
+The remaining gap is entirely GEMM1. Compact-route GEMM1 still issues 3.429M
+TCC requests versus 2.707M for sorted `f16in`.
+
+ATT-inspired rolling prefetch, next-batch overlap, two-K-tile scale prefetch,
+and half-major payload ordering were all implemented and rejected. None beat
+the original four-role batch schedule; detailed negative results are recorded
+in `docs/benchmarks/wavescope_glm52_m16/README.md`.
+
 ### 3. Multi-route wave-specialized workgroups
 
 Pack independent route/N tasks into the four waves of one workgroup. Each wave

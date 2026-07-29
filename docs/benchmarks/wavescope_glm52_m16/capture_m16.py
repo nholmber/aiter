@@ -63,6 +63,20 @@ workspace_scale = torch.empty(
     (workspace_blocks * INTER,), dtype=torch.uint8
 )
 workspace_out = torch.empty((M, H), dtype=torch.bfloat16)
+metadata_rows = M * (TOPK - 1) * 16
+metadata_blocks = M * (TOPK - 1)
+sorted_token_ids_workspace = torch.empty(
+    (metadata_rows,), dtype=torch.int32
+)
+sorted_weights_workspace = torch.empty(
+    (metadata_rows,), dtype=torch.float32
+)
+expert_ids_workspace = torch.empty(
+    (metadata_blocks,), dtype=torch.int32
+)
+counts_workspace = torch.empty(
+    (metadata_blocks,), dtype=torch.int32
+)
 
 main_blocks = M * TOPK
 main_inter_q = torch.empty(
@@ -87,6 +101,10 @@ def run_ours():
         out=workspace_out,
         inter_q=workspace_q,
         inter_scale=workspace_scale,
+        sorted_token_ids=sorted_token_ids_workspace,
+        sorted_weights=sorted_weights_workspace,
+        expert_ids=expert_ids_workspace,
+        counts=counts_workspace,
     )
 
 
