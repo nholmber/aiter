@@ -17,6 +17,7 @@ from aiter.fused_moe import (
     fused_moe,
     fused_moe_1stage,
     fused_topk,
+    moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -25,6 +26,7 @@ from aiter.ops.flydsl.mxfp4_flat_single_stage_moe_kernels import (
     _SYNC_WORKSPACES,
     flydsl_mxfp4_flat_single_stage_moe,
 )
+from aiter.ops.quant import mxfp4_moe_sort_fwd
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
 
@@ -36,6 +38,10 @@ TOPK = 9
 ASM_KERNELS = {
     128: "_ZN5aiter50fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_silu_16x128E",
     256: "_ZN5aiter50fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_silu_16x256E",
+}
+ASM_SORTED_KERNELS = {
+    256: "_ZN5aiter49fmoe_bf16_pertokenMXfp4_g1u1_novs_silu_2tg_32x256E",
+    512: "_ZN5aiter49fmoe_bf16_pertokenMXfp4_g1u1_novs_silu_1tg_32x512E",
 }
 
 
@@ -178,6 +184,22 @@ def main():
         print(
             f"  public dispatch diff={normalized_diff(reference, public_out):.8e}"
         )
+        public_us = elapsed_us(
+            lambda: fused_moe(
+                hidden,
+                w1_kernel,
+                w2_kernel,
+                topk_weights,
+                topk_ids,
+                activation=aiter.ActivationType.Silu,
+                quant_type=aiter.QuantType.per_1x32,
+                w1_scale=w1_scale_kernel,
+                w2_scale=w2_scale_kernel,
+            ),
+            args.warmup,
+            args.iterations,
+        )
+        print(f"  public-selected: {public_us:.3f} us")
         flat_us = elapsed_us(
             lambda: flydsl_mxfp4_flat_moe(
                 hidden_states=hidden,
@@ -193,38 +215,8 @@ def main():
         )
         print(f"  flydsl-2stage: {flat_us:.3f} us")
 
-        single_out = flydsl_mxfp4_flat_single_stage_moe(
-            hidden_states=hidden,
-            w1=w1_kernel,
-            w1_scale=w1_scale_kernel,
-            w2=w2_kernel,
-            w2_scale=w2_scale_kernel,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-        torch.cuda.synchronize()
-        single_diff = normalized_diff(flat_out, single_out)
-        single_us = elapsed_us(
-            lambda: flydsl_mxfp4_flat_single_stage_moe(
-                hidden_states=hidden,
-                w1=w1_kernel,
-                w1_scale=w1_scale_kernel,
-                w2=w2_kernel,
-                w2_scale=w2_scale_kernel,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            ),
-            args.warmup,
-            args.iterations,
-        )
-        print(
-            f"  flydsl-1stage-chunk128: {single_us:.3f} us "
-            f"diff_vs_flat={single_diff:.8e} "
-            f"diff_vs_ref={normalized_diff(reference, single_out):.8e}"
-        )
-        repeat_diffs = []
-        for _ in range(args.correctness_repeats):
-            repeated = flydsl_mxfp4_flat_single_stage_moe(
+        if m <= 4:
+            single_out = flydsl_mxfp4_flat_single_stage_moe(
                 hidden_states=hidden,
                 w1=w1_kernel,
                 w1_scale=w1_scale_kernel,
@@ -234,19 +226,28 @@ def main():
                 topk_weights=topk_weights,
             )
             torch.cuda.synchronize()
-            repeat_diffs.append(normalized_diff(reference, repeated))
-        if repeat_diffs:
+            single_diff = normalized_diff(flat_out, single_out)
+            single_us = elapsed_us(
+                lambda: flydsl_mxfp4_flat_single_stage_moe(
+                    hidden_states=hidden,
+                    w1=w1_kernel,
+                    w1_scale=w1_scale_kernel,
+                    w2=w2_kernel,
+                    w2_scale=w2_scale_kernel,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                ),
+                args.warmup,
+                args.iterations,
+            )
             print(
-                "    repeated correctness: "
-                f"min={min(repeat_diffs):.8e} "
-                f"max={max(repeat_diffs):.8e}"
+                f"  flydsl-1stage-chunk128: {single_us:.3f} us "
+                f"diff_vs_flat={single_diff:.8e} "
+                f"diff_vs_ref={normalized_diff(reference, single_out):.8e}"
             )
-
-        if args.graph_replays:
-            graph = torch.cuda.CUDAGraph()
-            torch.cuda.synchronize()
-            with torch.cuda.graph(graph):
-                graph_out = flydsl_mxfp4_flat_single_stage_moe(
+            repeat_diffs = []
+            for _ in range(args.correctness_repeats):
+                repeated = flydsl_mxfp4_flat_single_stage_moe(
                     hidden_states=hidden,
                     w1=w1_kernel,
                     w1_scale=w1_scale_kernel,
@@ -255,38 +256,64 @@ def main():
                     topk_ids=topk_ids,
                     topk_weights=topk_weights,
                 )
-            graph_diffs = []
-            for _ in range(args.graph_replays):
-                graph.replay()
                 torch.cuda.synchronize()
-                graph_diffs.append(normalized_diff(reference, graph_out))
-            print(
-                "    graph replay correctness: "
-                f"min={min(graph_diffs):.8e} "
-                f"max={max(graph_diffs):.8e}"
-            )
-        if single_diff > 1e-3:
-            single_out_2 = flydsl_mxfp4_flat_single_stage_moe(
-                hidden_states=hidden,
-                w1=w1_kernel,
-                w1_scale=w1_scale_kernel,
-                w2=w2_kernel,
-                w2_scale=w2_scale_kernel,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
-            torch.cuda.synchronize()
-            print(
-                "    debug: "
-                f"ref_norm={flat_out.float().norm().item():.6f} "
-                f"out_norm={single_out.float().norm().item():.6f} "
-                f"max_abs={(flat_out.float() - single_out.float()).abs().max().item():.6f} "
-                f"nan={torch.isnan(single_out).sum().item()} "
-                f"repeat_diff={normalized_diff(single_out, single_out_2):.8e} "
-                f"repeat_ref_diff={normalized_diff(flat_out, single_out_2):.8e} "
-                f"repeat_norm={single_out_2.float().norm().item():.6f} "
-                f"sync={[x.cpu().tolist() for x in _SYNC_WORKSPACES.values()]}"
-            )
+                repeat_diffs.append(normalized_diff(reference, repeated))
+            if repeat_diffs:
+                print(
+                    "    repeated correctness: "
+                    f"min={min(repeat_diffs):.8e} "
+                    f"max={max(repeat_diffs):.8e}"
+                )
+
+            if args.graph_replays:
+                graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph):
+                    graph_out = flydsl_mxfp4_flat_single_stage_moe(
+                        hidden_states=hidden,
+                        w1=w1_kernel,
+                        w1_scale=w1_scale_kernel,
+                        w2=w2_kernel,
+                        w2_scale=w2_scale_kernel,
+                        topk_ids=topk_ids,
+                        topk_weights=topk_weights,
+                    )
+                graph_diffs = []
+                for _ in range(args.graph_replays):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    graph_diffs.append(
+                        normalized_diff(reference, graph_out)
+                    )
+                print(
+                    "    graph replay correctness: "
+                    f"min={min(graph_diffs):.8e} "
+                    f"max={max(graph_diffs):.8e}"
+                )
+            if single_diff > 1e-3:
+                single_out_2 = flydsl_mxfp4_flat_single_stage_moe(
+                    hidden_states=hidden,
+                    w1=w1_kernel,
+                    w1_scale=w1_scale_kernel,
+                    w2=w2_kernel,
+                    w2_scale=w2_scale_kernel,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
+                torch.cuda.synchronize()
+                print(
+                    "    debug: "
+                    f"ref_norm={flat_out.float().norm().item():.6f} "
+                    f"out_norm={single_out.float().norm().item():.6f} "
+                    f"max_abs={(flat_out.float() - single_out.float()).abs().max().item():.6f} "
+                    f"nan={torch.isnan(single_out).sum().item()} "
+                    f"repeat_diff={normalized_diff(single_out, single_out_2):.8e} "
+                    f"repeat_ref_diff={normalized_diff(flat_out, single_out_2):.8e} "
+                    f"repeat_norm={single_out_2.float().norm().item():.6f} "
+                    f"sync={[x.cpu().tolist() for x in _SYNC_WORKSPACES.values()]}"
+                )
+        else:
+            print("  flydsl-1stage-chunk128: skipped (M>4 residency bound)")
 
         for subgu, kernel_name in ASM_KERNELS.items():
             (
@@ -340,6 +367,120 @@ def main():
                 f"  asm-1stage-subgu{subgu}: {asm_us:.3f} us "
                 f"diff_vs_flat={diff:.8e} "
                 f"diff_vs_ref={normalized_diff(reference, asm_out):.8e}"
+            )
+
+        for subgu, kernel_name in ASM_SORTED_KERNELS.items():
+            def run_sorted_asm():
+                (
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                ) = moe_sorting(
+                    topk_ids,
+                    topk_weights,
+                    EXPERTS,
+                    HIDDEN,
+                    dtypes.bf16,
+                    block_size=32,
+                    accumulate=True,
+                )
+                return fused_moe_1stage(
+                    hidden,
+                    w1_kernel,
+                    w2_kernel,
+                    TOPK,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    True,
+                    block_size_M=32,
+                    activation=aiter.ActivationType.Silu,
+                    quant_type=aiter.QuantType.per_1x32,
+                    xbf16=False,
+                    kernelName=kernel_name,
+                    q_dtype_a=dtypes.fp4x2,
+                    q_dtype_w=dtypes.fp4x2,
+                    w1_scale=w1_scale_kernel,
+                    w2_scale=w2_scale_kernel,
+                    M=m,
+                    device=hidden.device,
+                    doweight_stage1=False,
+                )
+
+            sorted_out = run_sorted_asm()
+            torch.cuda.synchronize()
+            sorted_us = elapsed_us(
+                run_sorted_asm,
+                args.warmup,
+                args.iterations,
+            )
+            print(
+                f"  asm-sorted-1stage-subgu{subgu}: {sorted_us:.3f} us "
+                f"diff_vs_ref={normalized_diff(reference, sorted_out):.8e}"
+            )
+
+            (
+                pre_sorted_ids,
+                pre_sorted_weights,
+                pre_sorted_expert_ids,
+                pre_num_valid_ids,
+                pre_moe_buf,
+            ) = moe_sorting(
+                topk_ids,
+                topk_weights,
+                EXPERTS,
+                HIDDEN,
+                dtypes.bf16,
+                block_size=32,
+                accumulate=True,
+            )
+            pre_a1, pre_a1_scale = quant(
+                hidden,
+                quant_dtype=dtypes.fp4x2,
+            )
+            pre_a1_scale = mxfp4_moe_sort_fwd(
+                pre_a1_scale,
+                sorted_ids=pre_sorted_ids,
+                num_valid_ids=pre_num_valid_ids,
+                token_num=m,
+                cols=HIDDEN,
+            )
+
+            def run_sorted_kernel_only():
+                pre_moe_buf.zero_()
+                aiter.fmoe_g1u1(
+                    pre_moe_buf,
+                    pre_a1,
+                    w1_kernel,
+                    w2_kernel,
+                    pre_sorted_ids,
+                    pre_sorted_weights,
+                    pre_sorted_expert_ids,
+                    pre_num_valid_ids,
+                    TOPK,
+                    pre_a1_scale,
+                    w1_scale_kernel.view(EXPERTS, -1),
+                    w2_scale_kernel.view(EXPERTS, -1),
+                    kernel_name,
+                    fc2_smooth_scale=None,
+                    activation=aiter.ActivationType.Silu,
+                )
+                return pre_moe_buf
+
+            kernel_only_out = run_sorted_kernel_only()
+            torch.cuda.synchronize()
+            kernel_only_us = elapsed_us(
+                run_sorted_kernel_only,
+                args.warmup,
+                args.iterations,
+            )
+            print(
+                f"    prequantized kernel+zero: {kernel_only_us:.3f} us "
+                f"diff_vs_ref={normalized_diff(reference, kernel_only_out):.8e}"
             )
 
 

@@ -1079,3 +1079,40 @@ Selection:
 
 M=2 is too close to justify the additional numerical drift, and M=4 loses
 because the one-stage workgroups serialize all hidden-output tiles.
+
+#### Single-stage ceiling above M=4
+
+The existing assembly kernels were forced at M=8 and M=16 to determine whether
+additional FlyDSL tuning could plausibly make flat one-stage competitive.
+
+| M | Main sorted `f16in` shared (us) | Two-stage flat FlyDSL (us) | Best flat one-stage ASM (us) | Sorted one-stage ASM kernel+zero (us) |
+|---:|---:|---:|---:|---:|
+| 8 | 51.99 | 62.69 | 67.18 (`subGU=256`) | 74.69 (`subGU=256`) |
+| 16 | 84.84 | 109.91 | 120.32 (`subGU=128`) | 98.96 (`subGU=256`) |
+
+The sorted one-stage column is already prequantized and excludes the separate
+sort and activation-quant preparation, so its total pipeline would be slower
+than shown.
+
+The route-direct one-stage grid has enough workgroups at M=8:
+
+- `subGU=256`: `M * topk * 2 = 144` workgroups
+- `subGU=128`: `M * topk * 4 = 288` workgroups
+
+Occupancy is therefore not the missing ingredient. Each workgroup must
+serialize all 24 hidden-output tiles after computing its G1 chunk. The
+two-stage kernel instead dispatches those output tiles independently. At
+M=8/16, MXMOE also gains from compacting duplicate experts, while flat
+one-stage recomputes every route.
+
+The non-flat sorted one-stage assembly ceiling also loses before sort/quant
+overhead is added. A FlyDSL rewrite of the same geometry cannot reasonably
+recover the 29% M=8 or 42% M=16 gap to sorted `f16in`.
+
+Conclusion:
+
+- Continue tuning the M=1 single-stage kernel.
+- Keep M=2 only if an e2e profile proves the noise-level microbenchmark win.
+- Do not pursue flat or sorted one-stage G1+G2 fusion for M>=8.
+- Intermediate/high concurrency work should retain two stages and focus on
+  Stage-1 weight traffic, duplicate-expert reuse, or better compact dispatch.
