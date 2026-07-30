@@ -4,7 +4,7 @@ Build from the self-contained context:
 
 ```bash
 docker build \
-  -t nholmber/glm52-fused-moe:3f5972f5c \
+  -t nholmber/glm52-fused-moe:47208fb1a \
   docker/glm52_token_wave
 ```
 
@@ -13,12 +13,11 @@ The derivative starts from:
 `amdsiloai/vllm-private:vllm_69715823_aiter_4a1cc77_glm52_production_tp4_pr1_pr50008`
 
 It overlays the specialized FlyDSL low-M kernels and enables the guarded
-public `aiter.fused_moe` dispatch for actual M=1 through M=16:
+public `aiter.fused_moe` dispatch for actual M=1 through M=4:
 
-- M=1–2: route-direct flat BN128
+- M=1: one-launch route-direct flat, 128-wide intermediate chunks
+- M=2: two-launch route-direct flat BN128
 - M=3–4: deterministic shared-hybrid BN128
-- M=5–8: token-wave BN64
-- M=9–16: compact token-wave BN128 with grouped routed GEMM2
 
 All other shapes and token counts retain the base image's production path.
 
@@ -35,23 +34,23 @@ inference-testing \
 
 ## Image
 
-- Tag: `nholmber/glm52-fused-moe:3f5972f5c`
+- Tag: `nholmber/glm52-fused-moe:47208fb1a`
 - Registry tag:
-  `amdsiloai/vllm-private:vllm_69715823_aiter_3f5972f5c_glm52_fused_moe_m1_m16`
+  `amdsiloai/vllm-private:vllm_69715823_aiter_47208fb1a_glm52_fused_moe_m1_m4_s1`
 - Registry digest:
-  `sha256:42b3dc81d2f5bb868799c26ee932c989addb0ca14cb1e5cecf50417e922a03dc`
+  `sha256:11c9bfc62533c3b0955197017f4092f3fa1271afe0f76e7b611b439b4c1ca7ba`
 - Image ID:
-  `sha256:c4bc1fa9b0b6177eb93c87a53e21d502ec56cedd96b523abca9f345a0ec0fb83`
+  `sha256:b461b897892fde2537f1d6fa34f357837795aad01c48986d656705daa1ca27db`
 - Size: 36.3 GB
-- Overlay layer: approximately 802 KiB
-- AITER source revision: `3f5972f5c`
+- AITER source revision: `47208fb1a`
 - Base image and its vLLM integration are unchanged.
 
 ## Profiling A/B
 
-Matched PyTorch/Kineto profiling configurations for the production MXMOE
-baseline and the fused M=1–16 image are in `profiling/`. They cover 60k/600
-workloads at concurrency 1, 2, 4, 8, and 16.
+The completed PyTorch/Kineto profiling configurations for the production
+MXMOE baseline and the earlier fused M=1–16 image are in `profiling/`. They
+cover 60k/600 workloads at concurrency 1, 2, 4, 8, and 16 and motivated the
+new M=4 cutoff.
 
 See `profiling/README.md` or run:
 
@@ -62,23 +61,23 @@ docker/glm52_token_wave/profiling/run_ab.sh
 ## Validation
 
 - AITER imports from `/tmp/aiter-main`.
-- The patched public `aiter.fused_moe` dispatch is enabled for actual M=1–16.
-- Flat, shared-hybrid, and token-wave modules import from the overlaid source
-  tree.
-- Built-image public-dispatch correctness checks on gfx950 GPU 4:
+- The patched public `aiter.fused_moe` dispatch is enabled for actual M=1–4.
+- Single-stage flat, two-stage flat, and shared-hybrid modules import from the
+  overlaid source tree.
+- Built-image M=1 validation on gfx950 GPU 0:
 
-  | M | selected path | normalized difference |
-  |---:|:---|---:|
-  | 1 | flat | `1.139e-5` |
-  | 2 | flat | `1.267e-5` |
-  | 3 | shared-hybrid | `5.748e-6` |
-  | 4 | shared-hybrid | `5.376e-6` |
-  | 5 | token-wave | `6.302e-6` |
+  - Public dispatch selected the single-stage kernel.
+  - Normalized difference versus the independent torch reference was
+    approximately `3.1e-5`.
+  - Five ordinary repeats and five graph replays remained below `3.6e-5`.
 
-- ASE dry-run expanded all 22 benchmark experiments and retained the intended
-  image tag and M=1–16 environment guard.
+- Synthetic steady-state M=1 performance was approximately 17% faster than
+  the two-stage flat FlyDSL path.
 
-Four-GPU end-to-end validation was subsequently completed on GPUs 0–3:
+## Earlier M=1–16 image validation
+
+The previous `3f5972f5c` M=1–16 image completed four-GPU coherence and GSM8K
+validation on GPUs 0–3:
 
 - TP4 vLLM started with async scheduling, FP8 KV cache, the production shared
   expert integration, and the M=1–16 fused-MoE guard.

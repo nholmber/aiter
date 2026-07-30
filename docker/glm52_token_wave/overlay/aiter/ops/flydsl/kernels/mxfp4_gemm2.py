@@ -356,6 +356,7 @@ def _gemm2_body(
     direct_weight_stride=1,
     direct_weight_col=0,
     direct_sequential_weight_one=False,
+    direct_k_half=None,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -557,7 +558,55 @@ def _gemm2_body(
     def _kloop_fence():
         gpu.barrier()
 
-    if const_expr(_K_TILES_TOTAL <= kStages):
+    if const_expr(direct_k_half is not None):
+        global_kt = direct_k_half // 2
+        half_in_tile = direct_k_half % 2
+        a_scale_tile = load_a_scale_tile(global_kt)
+        b_scale_tile = load_b_scale_tile(global_kt)
+        b_tile = load_b_tile(global_kt)
+        _kloop_fence()
+        a = issue_a_ds_read(0)
+        a_scale_sel = 0 if half_in_tile == 0 else 2
+        b_scale_base = 0 if half_in_tile == 0 else 2
+        for J in range_constexpr(4):
+            mni = J // 2
+            in_b = J % 2
+            sb = b_scale_tile[mni]
+            b_frag = b_tile[J][half_in_tile]
+            for sub in range_constexpr(_kSubBlocks):
+                sa = a_scale_tile[sub]
+                i0 = sub * 2
+                i1 = sub * 2 + 1
+                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty,
+                    [
+                        a[i0][half_in_tile],
+                        b_frag,
+                        zero4,
+                        4,
+                        4,
+                        a_scale_sel,
+                        sa,
+                        b_scale_base + in_b,
+                        sb,
+                    ],
+                )
+                if const_expr(_kMChunks > 1):
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [
+                            a[i1][half_in_tile],
+                            b_frag,
+                            zero4,
+                            4,
+                            4,
+                            a_scale_sel + 1,
+                            sa,
+                            b_scale_base + in_b,
+                            sb,
+                        ],
+                    )
+    elif const_expr(_K_TILES_TOTAL <= kStages):
         a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]

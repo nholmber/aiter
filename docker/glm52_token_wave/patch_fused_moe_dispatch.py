@@ -57,7 +57,21 @@ dispatch = '''    glm52_fused_moe_enabled = (
         and w1_scale is not None
         and w2_scale is not None
     ):
-        if M <= 2:
+        if M == 1:
+            from aiter.ops.flydsl.mxfp4_flat_single_stage_moe_kernels import (
+                flydsl_mxfp4_flat_single_stage_moe,
+            )
+
+            return flydsl_mxfp4_flat_single_stage_moe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                topk_ids=topk_ids,
+                topk_weights=topk_weight,
+            )
+        if M == 2:
             from aiter.ops.flydsl.mxfp4_flat_moe_kernels import (
                 flydsl_mxfp4_flat_moe,
             )

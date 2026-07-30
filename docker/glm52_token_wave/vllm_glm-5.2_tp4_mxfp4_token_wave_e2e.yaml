@@ -3,17 +3,17 @@ reporting:
   args:
     uri: databricks
     experiment_name: /amd--GLM-5.2-MXFP4
-    run_name: 20260729_vllm_tp4_glm52_mxfp4_fused_moe_3f5972f5c_e2e
+    run_name: 20260730_vllm_tp4_glm52_mxfp4_fused_moe_m1_m4_s1_47208fb1a_e2e
     tags:
       oob_phantom: true
       public: true
       framework: vllm
-      variant: fused_moe_3f5972f5c_e2e
+      variant: fused_moe_m1_m4_s1_47208fb1a_e2e
 server:
   type: docker
   stop_between_runs: false
   args:
-    image: nholmber/glm52-fused-moe:3f5972f5c
+    image: amdsiloai/vllm-private:vllm_69715823_aiter_47208fb1a_glm52_fused_moe_m1_m4_s1
     environment:
       SAFETENSORS_FAST_GPU: "1"
       HF_TOKEN: ${HF_TOKEN}
@@ -28,7 +28,7 @@ server:
       AITER_FP8_PAGED_MQA_LOGITS_FLYDSL: "0"
       AITER_GLM52_FUSED_MOE: "1"
       AITER_GLM52_FUSED_MOE_MIN_M: "1"
-      AITER_GLM52_FUSED_MOE_MAX_M: "16"
+      AITER_GLM52_FUSED_MOE_MAX_M: "4"
       HIP_VISIBLE_DEVICES: "0,1,2,3"
     command: vllm serve amd/GLM-5.2-MXFP4
     entrypoint: ""
