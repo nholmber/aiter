@@ -117,6 +117,52 @@ void mxfp4_moe_sort_quant_kernel(
         bf16_zero_ptr);
 }
 
+void mxfp4_moe_sort_quant_shared_kernel(
+    torch::Tensor& a_input,
+    torch::Tensor& topk_ids,
+    torch::Tensor& topk_weight,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& sorted_expert_ids,
+    torch::Tensor& cumsum_tensor,
+    torch::Tensor& reverse_sorted,
+    torch::Tensor& sorted_weights,
+    torch::Tensor& a_quant,
+    torch::Tensor& a_scale,
+    torch::Tensor& m_indices,
+    torch::Tensor& bf16_zero_out,
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const int M = static_cast<int>(a_input.size(0));
+
+    TORCH_CHECK(
+        NE == 257 && TOPK == 9 && D_HIDDEN == 6144 && MB == 16,
+        "mxfp4_moe_sort_quant_shared currently requires "
+        "NE=257, TOPK=9, D_HIDDEN=6144, MB=16");
+    TORCH_CHECK(M >= 1 && M <= 16,
+                "mxfp4_moe_sort_quant_shared requires 1 <= M <= 16");
+
+    void* bf16_zero_ptr =
+        (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
+    const std::string key =
+        "aux_sort_quant_shared_NE257_TOPK9_MB16_H6144";
+    aux_find(sort_quant_lookup(), key, "mxfp4_moe_sort_quant_shared")(
+        stream, M,
+        a_input.data_ptr(),
+        topk_ids.data_ptr<int32_t>(), topk_weight.data_ptr<float>(),
+        sorted_token_ids.data_ptr<int32_t>(),
+        sorted_expert_ids.data_ptr<int32_t>(),
+        cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
+        sorted_weights.data_ptr<float>(),
+        a_quant.data_ptr(), a_scale.data_ptr(),
+        m_indices.data_ptr<int32_t>(),
+        bf16_zero_ptr);
+}
+
 
 void mxfp4_moe_sort_kernel(
     torch::Tensor& topk_ids,

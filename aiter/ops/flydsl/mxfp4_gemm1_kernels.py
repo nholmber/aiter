@@ -13,6 +13,8 @@ _SUPPORTED = {
     (32, False, False),
     (64, False, False),
     (128, False, False),
+    (16, True, False),
+    (16, False, False),
     (16, True, True),
     (32, True, True),
 }
@@ -31,6 +33,7 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    direct_token_scales=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -46,6 +49,7 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        direct_token_scales=direct_token_scales,
     )
 
 
@@ -92,6 +96,7 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    direct_token_scales=False,
     stream=None,
 ):
     _assert_supported(
@@ -119,6 +124,7 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        direct_token_scales,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

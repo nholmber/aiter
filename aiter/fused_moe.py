@@ -725,11 +725,11 @@ def fused_moe_(
                 topk_weights=topk_weight,
             )
 
-        from aiter.ops.flydsl.mxfp4_token_wave_shared_moe_kernels import (
-            flydsl_mxfp4_token_wave_shared_moe,
+        from aiter.ops.flydsl.mxfp4_sort_quant_moe_kernels import (
+            flydsl_mxfp4_sort_quant_moe,
         )
 
-        return flydsl_mxfp4_token_wave_shared_moe(
+        return flydsl_mxfp4_sort_quant_moe(
             hidden_states=hidden_states,
             w1=w1,
             w1_scale=w1_scale,

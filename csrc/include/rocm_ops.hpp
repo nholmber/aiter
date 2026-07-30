@@ -2484,6 +2484,24 @@ namespace py = pybind11;
           py::arg("TOPK"),                                                \
           py::arg("D_HIDDEN"),                                            \
           py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_sort_quant_shared",                                  \
+          &mxfp4_moe_sort_quant_shared_kernel,                            \
+          py::arg("a_input"),                                             \
+          py::arg("topk_ids"),                                            \
+          py::arg("topk_weight"),                                         \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("sorted_expert_ids"),                                   \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("a_quant"),                                             \
+          py::arg("a_scale"),                                             \
+          py::arg("m_indices"),                                           \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
     m.def("mxfp4_moe_sort",                                               \
           &mxfp4_moe_sort_kernel,                                         \
           py::arg("topk_ids"),                                            \

@@ -26,10 +26,11 @@ from aiter.ops.flydsl.mxfp4_flat_single_stage_moe_kernels import (
     _SYNC_WORKSPACES,
     flydsl_mxfp4_flat_single_stage_moe,
 )
+from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
 from aiter.ops.quant import mxfp4_moe_sort_fwd
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
-
 
 HIDDEN = 6144
 INTER = 512
@@ -48,9 +49,7 @@ ASM_SORTED_KERNELS = {
 def normalized_diff(reference, actual):
     a = reference.double()
     b = actual.double()
-    return (
-        1 - 2 * (a * b).sum() / (a.square() + b.square()).sum()
-    ).item()
+    return (1 - 2 * (a * b).sum() / (a.square() + b.square()).sum()).item()
 
 
 def elapsed_us(fn, warmup, iterations):
@@ -74,19 +73,18 @@ def main():
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--correctness-repeats", type=int, default=5)
     parser.add_argument("--graph-replays", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--bm16-sweep", action="store_true")
+    parser.add_argument("--bm16-selected", action="store_true")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
-    torch.manual_seed(41)
+    torch.manual_seed(args.seed)
 
     max_m = max(args.m)
     hidden_all = torch.randn((max_m, HIDDEN), dtype=torch.bfloat16)
-    routed_scores = torch.randn(
-        (max_m, EXPERTS - 1), dtype=torch.bfloat16
-    )
-    w1 = torch.randn(
-        (EXPERTS, 2 * INTER, HIDDEN), dtype=torch.bfloat16
-    )
+    routed_scores = torch.randn((max_m, EXPERTS - 1), dtype=torch.bfloat16)
+    w1 = torch.randn((EXPERTS, 2 * INTER, HIDDEN), dtype=torch.bfloat16)
     w2 = torch.randn((EXPERTS, HIDDEN, INTER), dtype=torch.bfloat16)
 
     quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -181,9 +179,7 @@ def main():
             w2_scale=w2_scale_kernel,
         )
         torch.cuda.synchronize()
-        print(
-            f"  public dispatch diff={normalized_diff(reference, public_out):.8e}"
-        )
+        print(f"  public dispatch diff={normalized_diff(reference, public_out):.8e}")
         public_us = elapsed_us(
             lambda: fused_moe(
                 hidden,
@@ -200,6 +196,36 @@ def main():
             args.iterations,
         )
         print(f"  public-selected: {public_us:.3f} us")
+        if m >= 5 and args.graph_replays:
+            public_graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(public_graph):
+                public_graph_out = fused_moe(
+                    hidden,
+                    w1_kernel,
+                    w2_kernel,
+                    topk_weights,
+                    topk_ids,
+                    activation=aiter.ActivationType.Silu,
+                    quant_type=aiter.QuantType.per_1x32,
+                    w1_scale=w1_scale_kernel,
+                    w2_scale=w2_scale_kernel,
+                )
+            public_graph_us = elapsed_us(
+                public_graph.replay,
+                args.warmup,
+                args.iterations,
+            )
+            public_graph_diffs = []
+            for _ in range(args.graph_replays):
+                public_graph.replay()
+                torch.cuda.synchronize()
+                public_graph_diffs.append(normalized_diff(reference, public_graph_out))
+            print(
+                f"    graph replay: {public_graph_us:.3f} us "
+                f"diff_min={min(public_graph_diffs):.8e} "
+                f"diff_max={max(public_graph_diffs):.8e}"
+            )
         flat_us = elapsed_us(
             lambda: flydsl_mxfp4_flat_moe(
                 hidden_states=hidden,
@@ -282,9 +308,7 @@ def main():
                 for _ in range(args.graph_replays):
                     graph.replay()
                     torch.cuda.synchronize()
-                    graph_diffs.append(
-                        normalized_diff(reference, graph_out)
-                    )
+                    graph_diffs.append(normalized_diff(reference, graph_out))
                 print(
                     "    graph replay correctness: "
                     f"min={min(graph_diffs):.8e} "
@@ -370,6 +394,7 @@ def main():
             )
 
         for subgu, kernel_name in ASM_SORTED_KERNELS.items():
+
             def run_sorted_asm():
                 (
                     sorted_ids,
@@ -482,6 +507,383 @@ def main():
                 f"    prequantized kernel+zero: {kernel_only_us:.3f} us "
                 f"diff_vs_ref={normalized_diff(reference, kernel_only_out):.8e}"
             )
+
+        if m >= 5:
+            active = min(EXPERTS, m * TOPK)
+            max_sorted = (m * TOPK + active * 15 + 15) // 16 * 16
+            sorted_ids = torch.empty(
+                max_sorted,
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            sorted_expert_ids = torch.empty(
+                max_sorted // 16,
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            num_valid_ids = torch.empty(
+                2,
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            reverse_sorted = torch.empty(
+                m * TOPK,
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            sorted_weights = torch.empty(
+                max_sorted,
+                dtype=torch.float32,
+                device=hidden.device,
+            )
+            m_indices = torch.empty(
+                max_sorted,
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            a_quant = torch.empty(
+                (m, HIDDEN // 2),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            a_scale = torch.empty(
+                (m, HIDDEN // 32),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            out = torch.empty(
+                (m, HIDDEN),
+                dtype=torch.bfloat16,
+                device=hidden.device,
+            )
+            inter_quant = torch.empty(
+                (max_sorted, INTER // 2),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            inter_scale = torch.empty(
+                (max_sorted * 1024,),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            main_sorted_ids = torch.empty_like(sorted_ids)
+            main_sorted_expert_ids = torch.empty_like(sorted_expert_ids)
+            main_num_valid_ids = torch.empty_like(num_valid_ids)
+            main_reverse_sorted = torch.empty_like(reverse_sorted)
+            main_sorted_weights = torch.empty_like(sorted_weights)
+            main_m_indices = torch.empty_like(m_indices)
+            main_out = torch.empty_like(out)
+            main_inter_quant = torch.empty_like(inter_quant)
+            main_inter_scale = torch.empty_like(inter_scale)
+            main_dummy = torch.empty(
+                1,
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            empty_bf16 = torch.empty(
+                0,
+                dtype=torch.bfloat16,
+                device=hidden.device,
+            )
+
+            def run_bm16_sort_quant():
+                aiter.mxfp4_moe_sort_quant_shared(
+                    a_input=hidden,
+                    topk_ids=topk_ids,
+                    topk_weight=topk_weights,
+                    sorted_token_ids=sorted_ids,
+                    sorted_expert_ids=sorted_expert_ids,
+                    cumsum_tensor=num_valid_ids,
+                    reverse_sorted=reverse_sorted,
+                    sorted_weights=sorted_weights,
+                    a_quant=a_quant,
+                    a_scale=a_scale,
+                    m_indices=m_indices,
+                    bf16_zero_out=out,
+                    NE=EXPERTS,
+                    TOPK=TOPK,
+                    D_HIDDEN=HIDDEN,
+                    MB=16,
+                )
+
+            def run_bm16_gemm1(use_nt, bn=256, xcd_swizzle=0):
+                flydsl_mxfp4_gemm1(
+                    a_quant=a_quant,
+                    a_scale_sorted_shuffled=a_scale,
+                    w1_u8=w1_kernel,
+                    w1_scale_u8=w1_scale_kernel,
+                    sorted_expert_ids=sorted_expert_ids,
+                    cumsum_tensor=num_valid_ids,
+                    m_indices=m_indices,
+                    inter_sorted_quant=inter_quant,
+                    inter_sorted_shuffled_scale=inter_scale,
+                    hidden_states=hidden,
+                    n_tokens=m,
+                    BM=16,
+                    use_nt=use_nt,
+                    inline_quant=False,
+                    NE=EXPERTS,
+                    D_HIDDEN=HIDDEN,
+                    D_INTER=INTER,
+                    topk=TOPK,
+                    BN=bn,
+                    xcd_swizzle=xcd_swizzle,
+                    direct_token_scales=True,
+                )
+
+            def run_bm16_gemm2():
+                flydsl_mxfp4_gemm2(
+                    inter_sorted_quant=inter_quant,
+                    inter_sorted_shuffled_scale=inter_scale,
+                    w2_u8=w2_kernel,
+                    w2_scale_u8=w2_scale_kernel,
+                    sorted_expert_ids=sorted_expert_ids,
+                    cumsum_tensor=num_valid_ids,
+                    sorted_token_ids=sorted_ids,
+                    sorted_weights=sorted_weights,
+                    flat_out=out,
+                    M_logical=m,
+                    max_sorted=max_sorted,
+                    BM=16,
+                    use_nt=False,
+                    atomic=True,
+                    mxfp4out=False,
+                    NE=EXPERTS,
+                    D_HIDDEN=HIDDEN,
+                    D_INTER=INTER,
+                    topk=TOPK,
+                )
+
+            def run_bm16_quant_once(use_nt, bn=256, xcd_swizzle=0):
+                run_bm16_sort_quant()
+                run_bm16_gemm1(use_nt, bn, xcd_swizzle)
+                run_bm16_gemm2()
+                return out
+
+            def run_main_sort():
+                aiter.mxfp4_moe_sort(
+                    topk_ids=topk_ids,
+                    topk_weight=topk_weights,
+                    sorted_token_ids=main_sorted_ids,
+                    sorted_expert_ids=main_sorted_expert_ids,
+                    cumsum_tensor=main_num_valid_ids,
+                    reverse_sorted=main_reverse_sorted,
+                    sorted_weights=main_sorted_weights,
+                    m_indices=main_m_indices,
+                    bf16_zero_out=main_out,
+                    bf16_zero_workspace=empty_bf16,
+                    M_logical=m,
+                    NE=EXPERTS,
+                    TOPK=TOPK,
+                    D_HIDDEN=HIDDEN,
+                    D_INTER=1,
+                    MB=16,
+                    prologue=0,
+                )
+
+            def run_main_gemm1():
+                flydsl_mxfp4_gemm1(
+                    a_quant=main_dummy,
+                    a_scale_sorted_shuffled=main_dummy,
+                    w1_u8=w1_kernel,
+                    w1_scale_u8=w1_scale_kernel,
+                    sorted_expert_ids=main_sorted_expert_ids,
+                    cumsum_tensor=main_num_valid_ids,
+                    m_indices=main_m_indices,
+                    inter_sorted_quant=main_inter_quant,
+                    inter_sorted_shuffled_scale=main_inter_scale,
+                    hidden_states=hidden,
+                    n_tokens=m,
+                    BM=16,
+                    use_nt=True,
+                    inline_quant=True,
+                    NE=EXPERTS,
+                    D_HIDDEN=HIDDEN,
+                    D_INTER=INTER,
+                    topk=TOPK,
+                )
+
+            def run_main_gemm2():
+                flydsl_mxfp4_gemm2(
+                    inter_sorted_quant=main_inter_quant,
+                    inter_sorted_shuffled_scale=main_inter_scale,
+                    w2_u8=w2_kernel,
+                    w2_scale_u8=w2_scale_kernel,
+                    sorted_expert_ids=main_sorted_expert_ids,
+                    cumsum_tensor=main_num_valid_ids,
+                    sorted_token_ids=main_sorted_ids,
+                    sorted_weights=main_sorted_weights,
+                    flat_out=main_out,
+                    M_logical=m,
+                    max_sorted=max_sorted,
+                    BM=16,
+                    use_nt=False,
+                    atomic=True,
+                    mxfp4out=False,
+                    NE=EXPERTS,
+                    D_HIDDEN=HIDDEN,
+                    D_INTER=INTER,
+                    topk=TOPK,
+                )
+
+            def run_main_f16in():
+                run_main_sort()
+                run_main_gemm1()
+                run_main_gemm2()
+                return main_out
+
+            main_us = elapsed_us(
+                run_main_f16in,
+                args.warmup,
+                args.iterations,
+            )
+            main_result = run_main_f16in()
+            torch.cuda.synchronize()
+            main_diff = normalized_diff(reference, main_result)
+            main_sort_us = elapsed_us(
+                run_main_sort,
+                args.warmup,
+                args.iterations,
+            )
+            run_main_sort()
+            main_gemm1_us = elapsed_us(
+                run_main_gemm1,
+                args.warmup,
+                args.iterations,
+            )
+            run_main_gemm1()
+            torch.cuda.synchronize()
+            main_gemm2_us = elapsed_us(
+                run_main_gemm2,
+                args.warmup,
+                args.iterations,
+            )
+            print(
+                f"  forced-main-f16in: {main_us:.3f} us " f"diff_vs_ref={main_diff:.8e}"
+            )
+            print(
+                "    stages: "
+                f"sort={main_sort_us:.3f} us "
+                f"g1={main_gemm1_us:.3f} us "
+                f"g2={main_gemm2_us:.3f} us "
+                f"sum={main_sort_us + main_gemm1_us + main_gemm2_us:.3f} us"
+            )
+            if args.graph_replays:
+                main_graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                with torch.cuda.graph(main_graph):
+                    main_graph_out = run_main_f16in()
+                main_graph_us = elapsed_us(
+                    main_graph.replay,
+                    args.warmup,
+                    args.iterations,
+                )
+                main_graph.replay()
+                torch.cuda.synchronize()
+                print(
+                    f"    graph replay: {main_graph_us:.3f} us "
+                    f"diff={normalized_diff(reference, main_graph_out):.8e}"
+                )
+
+            sort_quant_us = elapsed_us(
+                run_bm16_sort_quant,
+                args.warmup,
+                args.iterations,
+            )
+            bm16_candidates = [
+                (256, True, 0),
+                (256, False, 0),
+            ]
+            if args.bm16_selected:
+                bm16_candidates = [
+                    (256, False, 8),
+                    (256, True, 1),
+                    (256, True, 4),
+                ]
+            elif args.bm16_sweep:
+                bm16_candidates.extend(
+                    (bn, use_nt, 0) for bn in (128, 64) for use_nt in (True, False)
+                )
+                bm16_candidates.extend(
+                    (256, use_nt, xcd_swizzle)
+                    for xcd_swizzle in (1, 2, 4, 8)
+                    for use_nt in (True, False)
+                )
+
+            for bn, use_nt, xcd_swizzle in bm16_candidates:
+                quant_once_us = elapsed_us(
+                    lambda: run_bm16_quant_once(
+                        use_nt,
+                        bn,
+                        xcd_swizzle,
+                    ),
+                    args.warmup,
+                    args.iterations,
+                )
+                quant_once_out = run_bm16_quant_once(
+                    use_nt,
+                    bn,
+                    xcd_swizzle,
+                )
+                torch.cuda.synchronize()
+                quant_once_diff = normalized_diff(reference, quant_once_out)
+
+                run_bm16_sort_quant()
+                gemm1_us = elapsed_us(
+                    lambda: run_bm16_gemm1(
+                        use_nt,
+                        bn,
+                        xcd_swizzle,
+                    ),
+                    args.warmup,
+                    args.iterations,
+                )
+                run_bm16_gemm1(use_nt, bn, xcd_swizzle)
+                torch.cuda.synchronize()
+                gemm2_us = elapsed_us(
+                    run_bm16_gemm2,
+                    args.warmup,
+                    args.iterations,
+                )
+                stage_sum_us = sort_quant_us + gemm1_us + gemm2_us
+                print(
+                    "  bm16-sortquant-preq-g1-"
+                    f"{'nt' if use_nt else 'cached'}"
+                    f"-bn{bn}-xcd{xcd_swizzle}: "
+                    f"{quant_once_us:.3f} us "
+                    f"diff_vs_ref={quant_once_diff:.8e}"
+                )
+                print(
+                    "    stages: "
+                    f"sort+quant={sort_quant_us:.3f} us "
+                    f"g1={gemm1_us:.3f} us "
+                    f"g2={gemm2_us:.3f} us "
+                    f"sum={stage_sum_us:.3f} us"
+                )
+                selected_candidate = (
+                    (not use_nt and xcd_swizzle == 8)
+                    or (use_nt and xcd_swizzle in (1, 4))
+                )
+                if args.graph_replays and selected_candidate:
+                    quant_graph = torch.cuda.CUDAGraph()
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(quant_graph):
+                        quant_graph_out = run_bm16_quant_once(
+                            use_nt,
+                            bn,
+                            xcd_swizzle,
+                        )
+                    quant_graph_us = elapsed_us(
+                        quant_graph.replay,
+                        args.warmup,
+                        args.iterations,
+                    )
+                    quant_graph.replay()
+                    torch.cuda.synchronize()
+                    print(
+                        f"    graph replay: {quant_graph_us:.3f} us "
+                        f"diff={normalized_diff(reference, quant_graph_out):.8e}"
+                    )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,24 @@ void mxfp4_moe_sort_quant_kernel(
     int64_t D_HIDDEN,
     int64_t MB);
 
+void mxfp4_moe_sort_quant_shared_kernel(
+    torch::Tensor& a_input,
+    torch::Tensor& topk_ids,
+    torch::Tensor& topk_weight,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& sorted_expert_ids,
+    torch::Tensor& cumsum_tensor,
+    torch::Tensor& reverse_sorted,
+    torch::Tensor& sorted_weights,
+    torch::Tensor& a_quant,
+    torch::Tensor& a_scale,
+    torch::Tensor& m_indices,
+    torch::Tensor& bf16_zero_out,
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB);
+
 void mxfp4_moe_sort_kernel(
     torch::Tensor& topk_ids,
     torch::Tensor& topk_weight,

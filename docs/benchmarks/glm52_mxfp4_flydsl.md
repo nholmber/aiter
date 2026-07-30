@@ -1116,3 +1116,110 @@ Conclusion:
 - Do not pursue flat or sorted one-stage G1+G2 fusion for M>=8.
 - Intermediate/high concurrency work should retain two stages and focus on
   Stage-1 weight traffic, duplicate-expert reuse, or better compact dispatch.
+
+## BM16 fused sort+quant with prequantized G1
+
+On July 30, 2026, the high-M direction returned to the conventional two-stage
+MXMOE geometry while retaining one useful fusion: sort routes, zero the atomic
+output, and quantize each BF16 token exactly once in the same preparation
+launch.
+
+Pipeline:
+
+1. A deterministic-shared BM16 auxiliary kernel sorts the eight routed slots,
+   appends expert 256 directly as the final block with weight 1, zeros the BF16
+   output, and emits one token-major MXFP4 activation plus e8m0 scales.
+2. BM16 FlyDSL G1 gathers token rows through `m_indices`. Its scale gather is
+   staged once into LDS, then reused by all four waves; the first prototype
+   instead reloaded the same scale dwords independently in every wave.
+3. The existing BM16 atomic FlyDSL G2 consumes the compact FP4 intermediate.
+
+Relevant implementation:
+
+- `aiter/ops/flydsl/mxfp4_sort_quant_moe_kernels.py`
+- `aiter/ops/flydsl/kernels/mxfp4_gemm1.py`
+- `csrc/kernels/mxfp4_moe/moe_aux/moe_sort_quant.cuh`
+- `aiter/fused_moe.py`
+
+The public GLM-5.2 specialized dispatch now selects:
+
+- M=1: flat one-stage
+- M=2: flat two-stage
+- M=3–4: deterministic shared-hybrid
+- M=5–8: fused sort+quant, cached W1, XCD=8
+- M=9: fused sort+quant, non-temporal W1, XCD=1
+- M=10–16: fused sort+quant, non-temporal W1, XCD=4
+
+The M=5–16 path remains guarded by `AITER_GLM52_FUSED_MOE=1` and the existing
+min/max-M environment variables.
+
+### Graph-replay comparison across the complete buckets
+
+The following representative shared-route run used seed 41. Both columns are
+captured three-launch graphs with all buffers preallocated. Main is forced to
+the upstream BM16 `f16in` G1 plus BM16 atomic G2.
+
+| Actual M | Forced `f16in` graph (us) | Quant-once graph (us) | Delta |
+|---:|---:|---:|---:|
+| 5 | 44.838 | 42.799 | -4.55% |
+| 6 | 50.458 | 48.584 | -3.71% |
+| 7 | 58.601 | 55.019 | -6.11% |
+| 8 | 60.015 | 58.533 | -2.47% |
+| 9 | 62.289 | 60.285 | -3.22% |
+| 10 | 77.875 | 77.087 | -1.01% |
+| 11 | 79.911 | 79.681 | -0.29% |
+| 12 | 81.614 | 81.241 | -0.46% |
+| 13 | 84.855 | 83.654 | -1.42% |
+| 14 | 87.498 | 87.038 | -0.53% |
+| 15 | 88.626 | 87.870 | -0.85% |
+| 16 | 89.732 | 88.780 | -1.06% |
+
+Three independent routing/weight seeds were then measured at the endpoints:
+
+| M | Seed | Forced `f16in` graph (us) | Selected quant-once graph (us) | Delta |
+|---:|---:|---:|---:|---:|
+| 8 | 1 | 59.603 | 57.572 | -3.41% |
+| 8 | 7 | 61.518 | 60.327 | -1.94% |
+| 8 | 99 | 57.276 | 56.094 | -2.06% |
+| 16 | 1 | 91.668 | 88.838 | -3.09% |
+| 16 | 7 | 91.800 | 90.953 | -0.92% |
+| 16 | 99 | 88.937 | 87.651 | -1.45% |
+
+The three-seed averages are:
+
+- M=8: 57.998 us versus 59.466 us, a 1.468 us / 2.47% win.
+- M=16: 89.147 us versus 90.802 us, a 1.654 us / 1.82% win.
+
+Normalized differences against the independent torch reference remained
+approximately `5.1e-6` to `6.7e-6`. Ordinary launches and graph replays both
+remained stable.
+
+### Stage observations
+
+Representative M=16 isolated timings were approximately:
+
+- Shared-aware fused sort+quant and output zero: 9.3–10.4 us.
+- Selected prequantized G1: 50.0–52.1 us.
+- Existing atomic G2: 26.0–26.6 us.
+
+The fused preparation is effectively the same cost as sort-only because the
+quant CTAs and output-zero CTAs finish under the single sorting CTA. The G1
+win comes from halving activation payload bytes and caching each compact
+block's scale operand in LDS. G2 is unchanged.
+
+### Rejected follow-ups
+
+- Direct per-MFMA token-scale loads were correct but duplicated scale traffic
+  in all four waves. Before LDS staging, M=8 was about 57 us and M=16 about
+  85.8 us.
+- Shrinking the generic 512-CTA/1024-thread auxiliary grid to 40 CTAs of 320
+  threads did not help; the sorting CTA, not the quant/zero tail, sets latency.
+- Replacing histogram/prefix sorting with one expert thread scanning every
+  route was correct but raised fused preparation to 13.5–15.1 us and M=16
+  end-to-end to about 95 us.
+- G1 BN128 and BN64 both lost at M=16. BN256 remains selected.
+- XCD changes are sub-microsecond, but graph sweeps consistently favored XCD8
+  for the cached M<=8 bucket and XCD4 near the top of the M=16 bucket.
+
+This establishes a small but repeatable production-relevant win without
+returning to a one-stage G1+G2 kernel.

@@ -45,6 +45,27 @@ def mxfp4_moe_sort_quant(
 
 
 @compile_ops("module_moe_mxfp4_aux")
+def mxfp4_moe_sort_quant_shared(
+    a_input: Tensor,
+    topk_ids: Tensor,
+    topk_weight: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    cumsum_tensor: Tensor,
+    reverse_sorted: Tensor,
+    sorted_weights: Tensor,
+    a_quant: Tensor,
+    a_scale: Tensor,
+    m_indices: Tensor,
+    bf16_zero_out: Tensor,
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+) -> None: ...
+
+
+@compile_ops("module_moe_mxfp4_aux")
 def mxfp4_moe_sort(
     topk_ids: Tensor,
     topk_weight: Tensor,

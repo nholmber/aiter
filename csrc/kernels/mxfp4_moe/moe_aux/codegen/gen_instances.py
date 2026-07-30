@@ -170,9 +170,9 @@ AUX_SCATTER_Q_PARAMS = """    int            M,
     void*          out"""
 
 
-def _aux_sort_quant_body(ne, topk, mb, h):
+def _aux_sort_quant_body(ne, topk, mb, h, launcher="launch"):
     return (
-        f"    aiter::mxfp4_moe::moe_sort_quant::launch<\n"
+        f"    aiter::mxfp4_moe::moe_sort_quant::{launcher}<\n"
         f"        {ne}, {topk}, {mb}, {h}, kNCtasSort, kThreadsSort>(\n"
         f"            stream, M,\n"
         f"            reinterpret_cast<const __hip_bfloat16*>(a_input),\n"
@@ -271,16 +271,31 @@ class mxfp4_moe_aux_codegen:
         self.working_path = Path(working_path)
 
     def enumerate_instances(self):
-        # sort_quant: MB=32 only
+        # Generic sort_quant: MB=32.
         for ne, h, e, topk in SHAPES:
-            for mb in (32,):
-                yield Instance(
-                    f"aux_sort_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
-                    "SortQuantFn",
-                    AUX_INC_SORT_QUANT,
-                    AUX_SORT_QUANT_PARAMS,
-                    _aux_sort_quant_body(ne, topk, mb, h),
-                )
+            yield Instance(
+                f"aux_sort_quant_NE{ne}_TOPK{topk}_MB32_H{h}",
+                "SortQuantFn",
+                AUX_INC_SORT_QUANT,
+                AUX_SORT_QUANT_PARAMS,
+                _aux_sort_quant_body(ne, topk, 32, h),
+            )
+
+        # GLM-5.2 decode: BM16 with expert 256 in the final top-k slot and
+        # shared weight exactly one.
+        yield Instance(
+            "aux_sort_quant_shared_NE257_TOPK9_MB16_H6144",
+            "SortQuantFn",
+            AUX_INC_SORT_QUANT,
+            AUX_SORT_QUANT_PARAMS,
+            _aux_sort_quant_body(
+                257,
+                9,
+                16,
+                6144,
+                launcher="launch_shared",
+            ),
+        )
 
         # sort (threestage): MB in {32, 64, 128}
         for ne, h, e, topk in SHAPES:
