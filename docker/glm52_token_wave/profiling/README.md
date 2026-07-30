@@ -63,5 +63,18 @@ Host trace directories:
 - MXMOE: `/tmp/traces_glm52_mxmoe_ab_20260730`
 - Fused-MoE: `/tmp/traces_glm52_fused_moe_ab_20260730`
 
+Analyze pure decode steps across all four TP ranks:
+
+```bash
+docker/glm52_token_wave/profiling/analyze_decode_ab.py \
+  --ranks all \
+  --workers 8 \
+  --json-output /tmp/glm52_decode_ab_all_ranks.json
+```
+
+The completed analysis and dispatch recommendation are in:
+
+`docs/benchmarks/glm52_mxfp4_decode_profile_ab_20260730.md`
+
 The configurations use GPUs 0–3 and port 8000. Both prior validation servers
 are stopped, so those resources were free when these files were created.
