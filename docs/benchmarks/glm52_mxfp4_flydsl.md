@@ -983,5 +983,57 @@ Built-image public-API validation on gfx950 GPU 4 produced:
 | 5 | token-wave | `6.302e-6` |
 
 The ASE configuration expanded all 22 requested experiments in dry-run mode.
-A full TP4 server smoke was intentionally not started because the existing
-`glm52-eval` workload was using GPUs 0–3.
+
+#### TP4 coherence and GSM8K validation
+
+After the existing `glm52-eval` workload drained, the derivative image was
+started on GPUs 0–3 with:
+
+- Tensor parallel size 4
+- Async scheduling
+- FP8 KV cache
+- Production AITER shared-expert integration
+- `AITER_GLM52_FUSED_MOE=1`
+- Actual-M guard 1 through 16
+
+The original production container was preserved in the stopped
+`glm52-eval-baseline-20260729` container.
+
+Coherence checks passed:
+
+- A single request identified Paris as the capital of France.
+- A single arithmetic request correctly derived `127 * 53 = 6731`.
+- Sixteen synchronized short-answer requests passed `16/16` expected-answer
+  checks in approximately 0.22 seconds wall time.
+
+GSM8K used the same sample recipe as the existing production result:
+
+- 100 examples
+- 5-shot
+- Concurrency 32
+- `max_gen_toks=8192`
+- Seed 44
+
+| Image | Flexible extract | Strict match |
+|:---|---:|---:|
+| Production `pr1_pr50008` | `0.95` | `0.94` |
+| Fused M=1–16 image | `0.95` | `0.95` |
+
+The per-example outputs changed, as expected from the numerical path change.
+For flexible extraction there were two gains and two losses relative to the
+production sample, leaving the aggregate score unchanged. Strict extraction
+had three gains and two losses, increasing the sample score by one point.
+
+All 100 generated responses were non-empty. Their median length was 1,199
+characters and the maximum was 10,810 characters. The longest response
+remained coherent and received a correct score. There were no server
+tracebacks, exceptions, NaNs, fatal errors, or failed API requests during the
+run.
+
+Artifacts:
+
+`/home/nholmber/silo-tiger-oob-benchmark-configs-2/phantom-configs/mi355/results_lmeval/glm52_fused_moe_3f5972f5c_gsm8k`
+
+The evaluation helper's final `GSM8K_SCORE` convenience line reports `0.0219`
+because its grep selects the standard error. The aggregated lm-eval table and
+results JSON are the source of truth for the `0.95` score.

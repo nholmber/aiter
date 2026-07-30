@@ -62,5 +62,31 @@ inference-testing \
 - ASE dry-run expanded all 22 benchmark experiments and retained the intended
   image tag and M=1–16 environment guard.
 
-The complete four-GPU server smoke test was not started during image creation
-because an existing `glm52-eval` container was actively holding GPUs 0–3.
+Four-GPU end-to-end validation was subsequently completed on GPUs 0–3:
+
+- TP4 vLLM started with async scheduling, FP8 KV cache, the production shared
+  expert integration, and the M=1–16 fused-MoE guard.
+- Single-request checks returned `Paris` and the correct
+  `127 * 53 = 6731` calculation.
+- A synchronized 16-request coherence batch passed `16/16` checks in
+  approximately 0.22 seconds wall time.
+- A baseline-matched GSM8K sample used 100 examples, 5-shot prompting,
+  concurrency 32, and `max_gen_toks=8192`:
+
+  | Image | Flexible extract | Strict match |
+  |:---|---:|---:|
+  | Production base | `0.95` | `0.94` |
+  | Fused M=1–16 | `0.95` | `0.95` |
+
+- All 100 GSM8K responses were non-empty. The longest response was 10,810
+  characters and remained coherent and correct.
+- No server traceback, exception, NaN, fatal error, or failed API request was
+  observed during the evaluation.
+
+The GSM8K result artifacts are under:
+
+`/home/nholmber/silo-tiger-oob-benchmark-configs-2/phantom-configs/mi355/results_lmeval/glm52_fused_moe_3f5972f5c_gsm8k`
+
+The helper script's final `GSM8K_SCORE` line incorrectly captures the metric
+standard error (`0.0219`). The aggregated lm-eval table and results JSON above
+contain the actual `0.95` score.
