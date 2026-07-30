@@ -3,17 +3,17 @@ reporting:
   args:
     uri: databricks
     experiment_name: /amd--GLM-5.2-MXFP4
-    run_name: 20260729_vllm_tp4_glm52_mxfp4_token_wave_ff3b34254_e2e
+    run_name: 20260729_vllm_tp4_glm52_mxfp4_fused_moe_3f5972f5c_e2e
     tags:
       oob_phantom: true
       public: true
       framework: vllm
-      variant: token_wave_ff3b34254_e2e
+      variant: fused_moe_3f5972f5c_e2e
 server:
   type: docker
   stop_between_runs: false
   args:
-    image: nholmber/glm52-token-wave:ff3b34254
+    image: nholmber/glm52-fused-moe:3f5972f5c
     environment:
       SAFETENSORS_FAST_GPU: "1"
       HF_TOKEN: ${HF_TOKEN}
@@ -26,9 +26,9 @@ server:
       VLLM_ROCM_USE_AITER_FP4BMM: "0"
       AITER_USE_FLYDSL_MOE_SORTING: "1"
       AITER_FP8_PAGED_MQA_LOGITS_FLYDSL: "0"
-      AITER_GLM52_TOKEN_WAVE: "1"
-      AITER_GLM52_TOKEN_WAVE_MIN_M: "5"
-      AITER_GLM52_TOKEN_WAVE_MAX_M: "16"
+      AITER_GLM52_FUSED_MOE: "1"
+      AITER_GLM52_FUSED_MOE_MIN_M: "1"
+      AITER_GLM52_FUSED_MOE_MAX_M: "16"
       HIP_VISIBLE_DEVICES: "0,1,2,3"
     command: vllm serve amd/GLM-5.2-MXFP4
     entrypoint: ""

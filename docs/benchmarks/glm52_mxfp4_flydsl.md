@@ -949,3 +949,39 @@ Lower-level XCD swizzles produced only noise-level changes:
 
 The existing BM16 atomic cached main configuration remains the best supported
 `f16in` recipe under deterministic shared routing.
+
+### Production-derived M=1–16 validation image
+
+On July 29, 2026, the specialized low-M dispatch was packaged on top of the
+unchanged production vLLM image:
+
+`amdsiloai/vllm-private:vllm_69715823_aiter_4a1cc77_glm52_production_tp4_pr1_pr50008`
+
+The derivative is:
+
+- Tag: `nholmber/glm52-fused-moe:3f5972f5c`
+- Image ID:
+  `sha256:c4bc1fa9b0b6177eb93c87a53e21d502ec56cedd96b523abca9f345a0ec0fb83`
+- Overlay size: approximately 802 KiB
+- Runtime guard: `AITER_GLM52_FUSED_MOE=1`, actual M=1 through M=16
+
+The public `aiter.fused_moe` dispatcher selects:
+
+- M=1–2: flat BN128
+- M=3–4: deterministic shared-hybrid BN128
+- M=5–8: token-wave BN64
+- M=9–16: compact token-wave BN128 plus grouped routed GEMM2
+
+Built-image public-API validation on gfx950 GPU 4 produced:
+
+| Actual M | Selected path | Normalized difference |
+|---:|:---|---:|
+| 1 | flat | `1.139e-5` |
+| 2 | flat | `1.267e-5` |
+| 3 | shared-hybrid | `5.748e-6` |
+| 4 | shared-hybrid | `5.376e-6` |
+| 5 | token-wave | `6.302e-6` |
+
+The ASE configuration expanded all 22 requested experiments in dry-run mode.
+A full TP4 server smoke was intentionally not started because the existing
+`glm52-eval` workload was using GPUs 0–3.
