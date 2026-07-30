@@ -16,6 +16,7 @@ from .mxfp4_gemm_common import (
     _fabs_f32,
     _gep3,
     _inline_dpp_quad_amax,
+    _lds_ptr3,
     _lds_swizzle_mask,
     _raw,
     _umax_i32,
@@ -170,6 +171,8 @@ def _gemm1_body(
     local_route_map_ptr=None,
     local_route_map_byte_offset=0,
     local_route_topk=1,
+    local_aq_base_i32=None,
+    local_aq_row_bytes=0,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -918,20 +921,31 @@ def _gemm1_body(
         else:
             output_row = None
             out_row = m_row + row_local
-        store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-        if const_expr(mapped_output):
-            if (output_row < fx.Int32(output_row_limit)) & n_lane_valid:
-                _scalar_store(
-                    aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32
-                )
-        else:
+        if const_expr(local_aq_base_i32 is not None):
+            local_base = _lds_ptr3(local_aq_base_i32, fx.Int32(0))
+            local_off = (
+                row_local * fx.Int32(local_aq_row_bytes)
+                + (n_block_idx & fx.Int32(1))
+                * fx.Int32(local_aq_row_bytes // 2)
+                + safe_n_lane * fx.Int32(4)
+            )
             if n_lane_valid:
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int32(4),
-                    packed,
-                    fx.Int32,
-                )
+                llvm.StoreOp(_raw(packed), _gep3(local_base, local_off))
+        else:
+            store_off = _layout_idx(aqout_layout, out_row, byte_pos)
+            if const_expr(mapped_output):
+                if (output_row < fx.Int32(output_row_limit)) & n_lane_valid:
+                    _scalar_store(
+                        aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32
+                    )
+            else:
+                if n_lane_valid:
+                    _scalar_store(
+                        aqout_tiles,
+                        store_off // fx.Int32(4),
+                        packed,
+                        fx.Int32,
+                    )
 
     # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
     ascaleout_layout = fx.make_layout(

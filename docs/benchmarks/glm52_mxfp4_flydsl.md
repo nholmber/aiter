@@ -1037,3 +1037,45 @@ Artifacts:
 The evaluation helper's final `GSM8K_SCORE` convenience line reports `0.0219`
 because its grep selects the standard error. The aggregated lm-eval table and
 results JSON are the source of truth for the `0.95` score.
+
+### Flat single-stage FlyDSL
+
+A true one-launch route-direct FlyDSL kernel was implemented for the GLM-5.2
+TP4 shape.
+
+Mapping:
+
+- Grid: `(token, top-k slot, 128-wide intermediate chunk)`.
+- Four workgroups cover the 512-wide intermediate for each route.
+- Each workgroup computes its G1 gate/up chunk and quantizes the activated
+  result directly into private LDS.
+- The same workgroup immediately runs the corresponding partial G2 across all
+  24 hidden-output tiles.
+- Partial route outputs are weighted and atomically accumulated.
+- A per-token all-block arrival/last-arriver protocol initializes output
+  inside the kernel and resets itself at completion. The grid is at most 144
+  workgroups for M<=4, below the 256-CU residency bound.
+
+Stable synthetic shared-route results:
+
+| M | FlyDSL two-stage (us) | FlyDSL one-stage (us) | Delta | ASM one-stage 128 (us) |
+|---:|---:|---:|---:|---:|
+| 1 | 54.23 | 44.77 | -17.4% | 47.78 |
+| 2 | 48.62 | 48.35 | -0.6% | 45.45 |
+| 4 | 49.50 | 52.11 | +5.3% | 45.59 |
+
+The one-stage M=1 normalized difference versus the independent torch
+reference was approximately `2.5e-5`. Twenty ordinary repeated launches and
+twenty CUDA/HIP graph replays remained correct; the maximum observed
+normalized difference was approximately `4.3e-5`, consistent with the
+non-deterministic BF16 atomic accumulation order and similar to the assembly
+flat path.
+
+Selection:
+
+- M=1: one-stage flat FlyDSL
+- M=2: retain two-stage flat FlyDSL
+- M=3–4: retain deterministic shared-hybrid FlyDSL
+
+M=2 is too close to justify the additional numerical drift, and M=4 loses
+because the one-stage workgroups serialize all hidden-output tiles.
