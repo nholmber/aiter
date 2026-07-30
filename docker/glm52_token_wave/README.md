@@ -36,12 +36,28 @@ inference-testing \
 ## Image
 
 - Tag: `nholmber/glm52-fused-moe:3f5972f5c`
+- Registry tag:
+  `amdsiloai/vllm-private:vllm_69715823_aiter_3f5972f5c_glm52_fused_moe_m1_m16`
+- Registry digest:
+  `sha256:42b3dc81d2f5bb868799c26ee932c989addb0ca14cb1e5cecf50417e922a03dc`
 - Image ID:
   `sha256:c4bc1fa9b0b6177eb93c87a53e21d502ec56cedd96b523abca9f345a0ec0fb83`
 - Size: 36.3 GB
 - Overlay layer: approximately 802 KiB
 - AITER source revision: `3f5972f5c`
 - Base image and its vLLM integration are unchanged.
+
+## Profiling A/B
+
+Matched PyTorch/Kineto profiling configurations for the production MXMOE
+baseline and the fused M=1–16 image are in `profiling/`. They cover 60k/600
+workloads at concurrency 1, 2, 4, 8, and 16.
+
+See `profiling/README.md` or run:
+
+```bash
+docker/glm52_token_wave/profiling/run_ab.sh
+```
 
 ## Validation
 

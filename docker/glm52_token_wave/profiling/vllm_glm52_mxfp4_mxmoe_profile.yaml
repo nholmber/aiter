@@ -1,0 +1,83 @@
+reporting:
+  type: mlflow
+  args:
+    uri: databricks
+    experiment_name: /amd--GLM-5.2-MXFP4
+    run_name: 20260730_vllm_tp4_glm52_mxfp4_production_mxmoe_ab_profile
+    tags:
+      oob_phantom: true
+      public: false
+      framework: vllm
+      profiling: true
+      comparison_group: glm52_mxfp4_fused_vs_mxmoe_20260730
+      variant: production_mxmoe
+server:
+  type: docker
+  stop_between_runs: false
+  args:
+    image: amdsiloai/vllm-private:vllm_69715823_aiter_4a1cc77_glm52_production_tp4_pr1_pr50008
+    environment:
+      SAFETENSORS_FAST_GPU: "1"
+      HF_TOKEN: ${HF_TOKEN}
+      VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: "0"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT4"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "1"
+      VLLM_ROCM_USE_AITER_MHA: "0"
+      VLLM_ROCM_USE_AITER_SPARSE_INDEXER: "1"
+      VLLM_ROCM_USE_AITER_FP4BMM: "0"
+      AITER_USE_FLYDSL_MOE_SORTING: "1"
+      AITER_FP8_PAGED_MQA_LOGITS_FLYDSL: "0"
+      HIP_VISIBLE_DEVICES: "0,1,2,3"
+    command: vllm serve amd/GLM-5.2-MXFP4
+    entrypoint: ""
+    args:
+      async_scheduling: true
+      host: 0.0.0.0
+      port: 8000
+      tensor_parallel_size: 4
+      trust_remote_code: true
+      enable_log_requests: false
+      max_num_seqs: 256
+      block_size: 64
+      gpu_memory_utilization: 0.85
+      max_model_len: 258048
+      kv_cache_dtype: fp8
+      no_enable_prefix_caching: true
+      compilation_config: '{"pass_config": {"fuse_rope_kvcache_cat_mla": true}, "use_inductor_graph_partition": true}'
+      profiler-config.profiler: torch
+      profiler-config.torch_profiler_dir: /tmp/traces
+      profiler-config.torch_profiler_with_stack: "false"
+    network_mode: host
+    ipc_mode: host
+    volumes:
+      - ${HOST_HF_HUB_CACHE}:/root/.cache/huggingface/hub
+      - /tmp/traces_glm52_mxmoe_ab_20260730:/tmp/traces
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    security_opt:
+      - seccomp=unconfined
+    group_add:
+      - video
+    shm_size: "128G"
+benchmarks:
+  - type: sglang_bench_serve
+    record_metrics: true
+    args:
+      backend: vllm
+      dataset-name: random
+      host: localhost
+      port: 8000
+      model: amd/GLM-5.2-MXFP4
+      ready-check-timeout-sec: 7200
+      request-rate: inf
+      random-range-ratio: 0.8
+      profile: true
+      profile-output-dir: /tmp/traces
+    sweep_config:
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 1,  warmup-requests: 1,  seed: 43, num-prompts: 8}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 2,  warmup-requests: 2,  seed: 43, num-prompts: 16}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 4,  warmup-requests: 4,  seed: 43, num-prompts: 32}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 8,  warmup-requests: 8,  seed: 43, num-prompts: 32}
+      - {random-input-len: 60000, random-output-len: 600, max-concurrency: 16, warmup-requests: 16, seed: 43, num-prompts: 32}
