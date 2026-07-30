@@ -47,7 +47,7 @@ The M=8 loss is similarly separated:
 There are 75 MoE layers per decode step. Values below are microseconds per MoE
 layer.
 
-| M | Production G1 | Production G2 | Production sort/quant | Production total | Fused G1 | Fused G2 | Fused total | Fused path delta |
+| M | Production G1 | Production G2 | Production adaptive aux | Production total | Fused G1 | Fused G2 | Fused total | Fused path delta |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | 10.956 | 6.208 | 13.194 | 30.357 | 17.601 | 4.899 | 22.500 | -7.858 |
 | 2 | 20.497 | 7.313 | 4.052 | 31.862 | 18.443 | 6.987 | 25.429 | -6.432 |
@@ -57,6 +57,13 @@ layer.
 
 At M=1, the production baseline is its tuned a4w4 recipe rather than the
 MXMOE `f16in` recipe used at M=2 and above.
+
+For M=2 and above, the traced kernel retains the internal
+`moe_sort_quant::sort_quant_kernel` template name, but the `f16in` path invokes
+it in sort-only mode. Its measured time includes the adaptive routing sort,
+auxiliary index generation, padding metadata, and atomic-output zero
+initialization. It does not include input quantization; G1 performs that
+internally.
 
 ### M=1
 
@@ -78,15 +85,15 @@ This is the cleanest fused win:
 
 - Fused G1 is 2.05 us/layer faster.
 - Fused G2 is 0.33 us/layer faster.
-- Removing sort/quant saves another 4.05 us/layer.
+- Removing the adaptive auxiliary launch saves another 4.05 us/layer.
 
 The MoE path saves 482 us per step and the decode step saves 453 us.
 
 ### M=4
 
 The shared-hybrid G1 and G2 are individually slower than production by 1.23
-and 0.55 us/layer. Removing 4.11 us/layer of sort/quant still yields a net
-2.34 us/layer MoE win and a 138 us decode-step win.
+and 0.55 us/layer. Removing 4.11 us/layer of adaptive auxiliary work still
+yields a net 2.34 us/layer MoE win and a 138 us decode-step win.
 
 ### M=8
 
@@ -94,7 +101,7 @@ Token-wave G1 is the regression:
 
 - G1: +6.55 us/layer
 - G2: +0.60 us/layer
-- Removed sort/quant: -4.05 us/layer
+- Removed adaptive auxiliary work: -4.05 us/layer
 - Net MoE regression: +3.09 us/layer, or +232 us/step
 - Decode-step regression: +322 us
 
@@ -109,7 +116,7 @@ The trace reproduces the microbenchmark conclusion:
 
 - G1: +5.66 us/layer
 - G2: +0.72 us/layer
-- Removed sort/quant: -4.23 us/layer
+- Removed adaptive auxiliary work: -4.23 us/layer
 - Net MoE regression: +2.16 us/layer, or +162 us/step
 - Decode-step regression: +160 us
 
@@ -117,6 +124,26 @@ The MoE path accounts for essentially 100% of the decode-step loss. If G2 is
 unchanged, compact token-wave G1 needs about 2.14 us/layer improvement to
 break even end to end, reducing 59.36 us to approximately 57.22 us. This is a
 3.6% Stage-1 target.
+
+## Adaptive sort cost
+
+The in-model adaptive auxiliary launch is nearly constant from M=2 through
+M=16:
+
+| M | Aux time per decode step | Time per MoE layer | Full-step share | MoE-path share |
+|---:|---:|---:|---:|---:|
+| 2 | 303.9 us | 4.052 us | 2.50% | 12.72% |
+| 4 | 308.5 us | 4.113 us | 2.43% | 11.02% |
+| 8 | 304.0 us | 4.053 us | 2.12% | 7.69% |
+| 16 | 317.1 us | 4.228 us | 1.78% | 4.91% |
+
+The prior isolated adaptive-sort microbenchmark measured approximately
+2.7–3.2 us. The trace is higher because the production auxiliary launch also
+emits the extra a4w4 indices and performs atomic-output zero initialization.
+
+M=1 is not directly comparable. Its tuned production recipe spends 989.5 us
+per step, or 13.19 us/layer, across two fused quant/sort launches and one
+one-shot sorting launch per MoE layer.
 
 ## Tail-step caveat
 
