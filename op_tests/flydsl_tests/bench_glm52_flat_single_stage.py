@@ -872,7 +872,6 @@ def main():
                 selected_candidate = (
                     (not use_nt and xcd_swizzle == 8)
                     or (use_nt and xcd_swizzle in (1, 4))
-                    or (bn == 512 and use_nt and xcd_swizzle == 0)
                 )
                 if args.graph_replays and selected_candidate:
                     quant_graph = torch.cuda.CUDAGraph()
