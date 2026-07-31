@@ -176,6 +176,7 @@ def _gemm1_body(
     local_aq_base_i32=None,
     local_aq_row_bytes=0,
     direct_token_scales=False,
+    pipeline_direct_scales=False,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -498,30 +499,33 @@ def _gemm1_body(
             out.append(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
         return out
 
-    def issue_a_scale_direct_load():
+    direct_scale_live = None
+    direct_scale_row_base = None
+    direct_scale_base = None
+    if const_expr(direct_token_scales):
         sorted_row = m_row + lane_mod_16
         token_id = fx.Int32(_raw(_global_i32_at(arg_mind, sorted_row)))
-        live = token_id < i32_ntok
-        safe_token = live.select(token_id, fx.Int32(0))
-        scale_base = _global_base_ptr1(arg_ascale)
-        row_base = safe_token * fx.Int32(K // 32)
+        direct_scale_live = token_id < i32_ntok
+        safe_token = direct_scale_live.select(token_id, fx.Int32(0))
+        direct_scale_base = _global_base_ptr1(arg_ascale)
+        direct_scale_row_base = safe_token * fx.Int32(K // 32)
+
+    def issue_a_scale_direct_tile(kt):
         # The MFMA scale operand has 64 dwords per K tile. Let each wave
-        # populate every fourth K tile so each dword is gathered exactly once,
-        # then let all four waves consume the cached LDS layout below. Reading
-        # directly at every MFMA duplicated the same token-scale traffic in
-        # all four waves.
-        for kt_group in range_constexpr((K_TILES_TOTAL + NWAVES - 1) // NWAVES):
-            kt = wave + fx.Int32(kt_group * NWAVES)
-            scale_col0 = kt * fx.Int32(8) + lane_div_16
+        # own every fourth tile so each dword is gathered exactly once. Stage
+        # the tile alongside the future A/B loads; the next loop barrier makes
+        # it visible to all four waves without a scale-only prologue.
+        if wave == fx.Int32(kt % NWAVES):
+            scale_col0 = fx.Int32(kt * 8) + lane_div_16
             scale_col1 = scale_col0 + fx.Int32(4)
             s0_i8 = llvm.load(
                 T.i8,
-                _gep1(scale_base, row_base + scale_col0),
+                _gep1(direct_scale_base, direct_scale_row_base + scale_col0),
                 invariant=True,
             )
             s1_i8 = llvm.load(
                 T.i8,
-                _gep1(scale_base, row_base + scale_col1),
+                _gep1(direct_scale_base, direct_scale_row_base + scale_col1),
                 invariant=True,
             )
             s0 = fx.Int32(arith.extui(T.i32, s0_i8))
@@ -529,7 +533,43 @@ def _gemm1_body(
             packed = s0 | (s1 << fx.Int32(16))
             packed = fx.Int32(
                 arith.select(
-                    _raw(live),
+                    _raw(direct_scale_live),
+                    _raw(packed),
+                    _raw(fx.Int32(0)),
+                )
+            )
+            lds_dw = fx.Int32(kt * 64) + lane
+            _scalar_store(asc_i32_tiles, lds_dw, packed, fx.Int32)
+
+    def issue_a_scale_direct_load():
+        for kt_group in range_constexpr(
+            (K_TILES_TOTAL + NWAVES - 1) // NWAVES
+        ):
+            kt = wave + fx.Int32(kt_group * NWAVES)
+            scale_col0 = kt * fx.Int32(8) + lane_div_16
+            scale_col1 = scale_col0 + fx.Int32(4)
+            s0_i8 = llvm.load(
+                T.i8,
+                _gep1(
+                    direct_scale_base,
+                    direct_scale_row_base + scale_col0,
+                ),
+                invariant=True,
+            )
+            s1_i8 = llvm.load(
+                T.i8,
+                _gep1(
+                    direct_scale_base,
+                    direct_scale_row_base + scale_col1,
+                ),
+                invariant=True,
+            )
+            s0 = fx.Int32(arith.extui(T.i32, s0_i8))
+            s1 = fx.Int32(arith.extui(T.i32, s1_i8))
+            packed = s0 | (s1 << fx.Int32(16))
+            packed = fx.Int32(
+                arith.select(
+                    _raw(direct_scale_live),
                     _raw(packed),
                     _raw(fx.Int32(0)),
                 )
@@ -760,7 +800,8 @@ def _gemm1_body(
     _relax_prologue = (BM == 128) and not inline_quant
     if const_expr(not inline_quant):
         if const_expr(direct_token_scales):
-            issue_a_scale_direct_load()
+            if const_expr(not pipeline_direct_scales):
+                issue_a_scale_direct_load()
         else:
             issue_a_scale_load()
     for K_C in range_constexpr(kStages):
@@ -791,6 +832,8 @@ def _gemm1_body(
             inline_quant_pack_write(K_C, scale_accum)
         else:
             issue_a_load_lds(K_C, K_C)
+            if const_expr(direct_token_scales and pipeline_direct_scales):
+                issue_a_scale_direct_tile(K_C)
             if const_expr(not _relax_prologue):
                 for j in range_constexpr(NJ):
                     issue_b_load_j(b[K_C], K_C, j)
@@ -817,6 +860,8 @@ def _gemm1_body(
             asc_cur = get_a_scale(K_C - kStages)
         if const_expr(not inline_quant):
             issue_a_load_lds(write_slot, K_C)
+            if const_expr(direct_token_scales and pipeline_direct_scales):
+                issue_a_scale_direct_tile(K_C)
         if const_expr(inline_quant):
             h_vs = []
             for B128_IDX in range_constexpr(2):
@@ -1059,6 +1104,7 @@ def compile_gemm1_a4w4_port(
     interleave=False,
     xcd_swizzle=0,
     direct_token_scales=False,
+    pipeline_direct_scales=False,
 ):
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -1075,6 +1121,10 @@ def compile_gemm1_a4w4_port(
         )
     if direct_token_scales and BM != 16:
         raise AssertionError("direct token-scale gather currently requires BM=16")
+    if pipeline_direct_scales and not direct_token_scales:
+        raise AssertionError(
+            "pipelined token-scale gather requires direct_token_scales=True"
+        )
 
     assert (
         BN in (64, 128, 256) and BK == 256
@@ -1109,6 +1159,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_xcd{xcd_swizzle}"
     if direct_token_scales:
         name_suffix += "_dts"
+    if pipeline_direct_scales:
+        name_suffix += "_pipe"
 
     @fx.struct
     class SharedStorage:
@@ -1192,6 +1244,7 @@ def compile_gemm1_a4w4_port(
                 NE=_NE,
                 interleave=interleave,
                 direct_token_scales=direct_token_scales,
+                pipeline_direct_scales=pipeline_direct_scales,
             )
 
     @flyc.jit

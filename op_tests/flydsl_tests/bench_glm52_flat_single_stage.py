@@ -629,6 +629,7 @@ def main():
                     BN=bn,
                     xcd_swizzle=xcd_swizzle,
                     direct_token_scales=True,
+                    pipeline_direct_scales=m <= 8,
                 )
 
             def run_bm16_gemm2():

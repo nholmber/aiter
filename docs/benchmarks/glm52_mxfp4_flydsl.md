@@ -1207,6 +1207,23 @@ quant CTAs and output-zero CTAs finish under the single sorting CTA. The G1
 win comes from halving activation payload bytes and caching each compact
 block's scale operand in LDS. G2 is unchanged.
 
+#### Selective direct-scale pipelining
+
+The initial direct-scale implementation gathered all 24 K-tile scale operands
+before G1 started loading weights. A follow-up pipelines one future scale tile
+alongside the corresponding A/B loads and relies on the existing K-loop
+barrier to publish it to all four waves.
+
+Same-GPU graph AB comparisons at M=8 reduced the selected path by:
+
+- Seed 41: approximately 0.40 us.
+- Seed 1: approximately 0.61 us.
+- Seed 7: approximately 0.28 us.
+
+The average improvement was approximately 0.43 us, or 0.7%. M=16 was neutral
+across the same checks and one seed regressed, so scale pipelining is enabled
+only for M=5–8. M>=9 retains the all-scales preload schedule.
+
 ### Rejected follow-ups
 
 - Direct per-MFMA token-scale loads were correct but duplicated scale traffic
@@ -1217,6 +1234,9 @@ block's scale operand in LDS. G2 is unchanged.
 - Replacing histogram/prefix sorting with one expert thread scanning every
   route was correct but raised fused preparation to 13.5–15.1 us and M=16
   end-to-end to about 95 us.
+- Collapsing `sorted_token_ids`, `m_indices`, and `reverse_sorted` into one
+  plain token-ID array removed unused metadata stores but did not improve the
+  preparation launch and slightly regressed the clean M=16 graph comparison.
 - G1 BN128 and BN64 both lost at M=16. BN256 remains selected.
 - XCD changes are sub-microsecond, but graph sweeps consistently favored XCD8
   for the cached M<=8 bucket and XCD4 near the top of the M=16 bucket.

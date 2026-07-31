@@ -146,6 +146,7 @@ def flydsl_mxfp4_sort_quant_moe(
         BK=256,
         xcd_swizzle=stage1_xcd,
         direct_token_scales=True,
+        pipeline_direct_scales=M <= 8,
         stream=stream,
     )
     flydsl_mxfp4_gemm2(
