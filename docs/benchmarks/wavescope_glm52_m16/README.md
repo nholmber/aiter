@@ -200,10 +200,45 @@ Two schedule changes derived from the trace were implemented and rejected:
   each SIMD and was numerically correct, but graph replay regressed by
   approximately 0.17 us because the larger workgroup and duplicated epilogue
   work outweighed the added latency hiding.
+- a correct GUGU gate/up-interleaved W1 preshuffle and matching interleaved
+  e8m0 scale layout regressed graph replay by approximately 1.9 us;
+- a lane-major scale layout that fetched four consecutive K-tile scale dwords
+  with one 128-bit load reduced scale VMEM instruction count, but regressed
+  graph replay by approximately 0.76 us because of the larger live scale
+  register batch.
 
 The trace closes simple instruction reordering as a meaningful M=16 lever.
 Further improvement requires either W1 reuse or a compact/persistent dispatch
 that places a second useful workgroup on more CUs.
+
+### Compulsory W1 traffic roofline
+
+The traced routing produces 101 compact BM16 expert blocks. G1 must read:
+
+- FP4 W1 payload: `101 * 1024 * 3072` = 317,718,528 bytes.
+- e8m0 W1 scales: `101 * 1024 * 192` = 19,857,408 bytes.
+- Total compulsory W1 data: 337,575,936 bytes.
+
+PMC reports 2,643,809 TCC misses. At a 128-byte line, that is 338,407,552
+bytes, only 0.25% above the compulsory W1 payload-plus-scale total. The
+54.2-us counter dispatch therefore sustains approximately 6.24 TB/s of miss
+traffic.
+
+At that observed bandwidth, the FP4 payload alone requires about 50.9 us and
+the scales about 3.2 us. This accounts for essentially the complete G1
+dispatch before activation reads and output stores are considered.
+
+Consequences:
+
+- Sorting has already removed duplicate-expert W1 reads.
+- The 16x16 preshuffle uses essentially every fetched cache line.
+- Gate/up interleaving and scale-vectorization cannot reduce compulsory bytes.
+- Persistent dispatch can improve balance but cannot reduce the dominant
+  memory volume.
+
+A material M=16 gain now requires changing the representation itself
+(fewer weight/scale bytes or cross-invocation reuse), not another local
+scheduling or tiling change.
 
 ## Primary bottlenecks
 

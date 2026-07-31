@@ -1235,7 +1235,16 @@ last MFMA group.
 Payload-half staggering regressed. Separating the two B-scale loads produced
 only -0.09 to +0.29 us graph movement across seeds, below the keep threshold.
 An eight-wave/512-thread BN256 variant was also correct but regressed graph
-replay by approximately 0.17 us. The selected schedule is unchanged.
+replay by approximately 0.17 us. A correct gate/up-interleaved W1 layout lost
+approximately 1.9 us, and vectorizing four K-tile scale dwords into one
+128-bit load lost approximately 0.76 us due to the larger live register batch.
+The selected schedule is unchanged.
+
+The traced M=16 routing has 101 compact expert blocks. Its compulsory W1
+payload plus e8m0 scales total 337.58 MB, while PMC records 338.41 MB of
+128-byte TCC miss lines. The difference is only 0.25%. At the measured
+54.2-us dispatch duration this is approximately 6.24 TB/s, establishing that
+the selected G1 is already at the compulsory-weight traffic floor.
 
 #### Selective direct-scale pipelining
 
