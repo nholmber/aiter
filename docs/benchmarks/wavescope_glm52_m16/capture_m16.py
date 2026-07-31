@@ -4,8 +4,9 @@ import os
 import torch
 
 # Repro harness for WaveScope/rocprofv3 ATT captures. Run from the repository
-# root with PYTHONPATH set to the checkout. ATT_MODE selects the token-wave or
-# forced f16in two-stage pipeline; rocprof's kernel filter chooses GEMM1/GEMM2.
+# root with PYTHONPATH set to the checkout. ATT_MODE selects the token-wave,
+# forced f16in, or fused-sort-quant pipeline; rocprof's kernel filter chooses
+# GEMM1/GEMM2.
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import fused_topk, moe_sorting
@@ -87,6 +88,34 @@ main_inter_scale = torch.empty(
 )
 dummy_q = torch.empty((1,), dtype=torch.uint8)
 dummy_s = torch.empty((1,), dtype=torch.uint8)
+
+quant_active = min(E, M * TOPK)
+quant_max_sorted = (
+    M * TOPK + quant_active * (16 - 1) + 16 - 1
+) // 16 * 16
+quant_sorted_ids = torch.empty(
+    quant_max_sorted, dtype=torch.int32
+)
+quant_sorted_expert_ids = torch.empty(
+    quant_max_sorted // 16, dtype=torch.int32
+)
+quant_num_valid_ids = torch.empty(2, dtype=torch.int32)
+quant_reverse_sorted = torch.empty(M * TOPK, dtype=torch.int32)
+quant_sorted_weights = torch.empty(
+    quant_max_sorted, dtype=torch.float32
+)
+quant_m_indices = torch.empty(
+    quant_max_sorted, dtype=torch.int32
+)
+quant_a = torch.empty((M, H // 2), dtype=torch.uint8)
+quant_a_scale = torch.empty((M, H // 32), dtype=torch.uint8)
+quant_out = torch.empty((M, H), dtype=torch.bfloat16)
+quant_inter_q = torch.empty(
+    (quant_max_sorted, INTER // 2), dtype=torch.uint8
+)
+quant_inter_scale = torch.empty(
+    quant_max_sorted * 64, dtype=torch.uint8
+)
 
 
 def run_ours():
@@ -175,7 +204,84 @@ def run_f16in():
     return main_out
 
 
-run = run_ours if MODE == "ours" else run_f16in
+def run_quant_once():
+    aiter.mxfp4_moe_sort_quant_shared(
+        a_input=x,
+        topk_ids=topk_ids,
+        topk_weight=topk_weights,
+        sorted_token_ids=quant_sorted_ids,
+        sorted_expert_ids=quant_sorted_expert_ids,
+        cumsum_tensor=quant_num_valid_ids,
+        reverse_sorted=quant_reverse_sorted,
+        sorted_weights=quant_sorted_weights,
+        a_quant=quant_a,
+        a_scale=quant_a_scale,
+        m_indices=quant_m_indices,
+        bf16_zero_out=quant_out,
+        NE=E,
+        TOPK=TOPK,
+        D_HIDDEN=H,
+        MB=16,
+    )
+    flydsl_mxfp4_gemm1(
+        a_quant=quant_a,
+        a_scale_sorted_shuffled=quant_a_scale,
+        w1_u8=w1_kernel,
+        w1_scale_u8=w1_s_kernel,
+        sorted_expert_ids=quant_sorted_expert_ids,
+        cumsum_tensor=quant_num_valid_ids,
+        m_indices=quant_m_indices,
+        inter_sorted_quant=quant_inter_q,
+        inter_sorted_shuffled_scale=quant_inter_scale,
+        hidden_states=x,
+        n_tokens=M,
+        BM=16,
+        use_nt=True,
+        inline_quant=False,
+        NE=E,
+        D_HIDDEN=H,
+        D_INTER=INTER,
+        topk=TOPK,
+        BN=256,
+        BK=256,
+        xcd_swizzle=4,
+        direct_token_scales=True,
+        pipeline_direct_scales=False,
+    )
+    flydsl_mxfp4_gemm2(
+        inter_sorted_quant=quant_inter_q,
+        inter_sorted_shuffled_scale=quant_inter_scale,
+        w2_u8=w2_kernel,
+        w2_scale_u8=w2_s_kernel,
+        sorted_expert_ids=quant_sorted_expert_ids,
+        cumsum_tensor=quant_num_valid_ids,
+        sorted_token_ids=quant_sorted_ids,
+        sorted_weights=quant_sorted_weights,
+        flat_out=quant_out,
+        M_logical=M,
+        max_sorted=quant_max_sorted,
+        BM=16,
+        use_nt=False,
+        atomic=True,
+        mxfp4out=False,
+        NE=E,
+        D_HIDDEN=H,
+        D_INTER=INTER,
+        topk=TOPK,
+        BN=256,
+        BK=256,
+    )
+    return quant_out
+
+
+if MODE == "ours":
+    run = run_ours
+elif MODE == "f16in":
+    run = run_f16in
+elif MODE == "quant_once":
+    run = run_quant_once
+else:
+    raise ValueError(f"unknown ATT_MODE={MODE!r}")
 for _ in range(WARMUPS):
     run()
 torch.cuda.synchronize()

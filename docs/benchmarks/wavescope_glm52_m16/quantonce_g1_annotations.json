@@ -1,0 +1,90 @@
+{
+  "annotations": [
+    {
+      "id": "w1-vmem-issue-backpressure",
+      "severity": "critical",
+      "title": "W1 load issue backpressure dominates 53-62% of long-wave time",
+      "note": "The four long traced waves spend an average 57.6% of their timeline in STALL, versus 26.1% for forced f16in. The stalls are concentrated on the first buffer_load_dwordx4 in paired future-W1 loads: idx 648 accumulates 9,936 stall cycles across four waves, idx 744 accumulates 5,700, idx 691 accumulates 5,416, and idx 879 accumulates 4,476. The second load in each pair is usually cheap, indicating that the first instruction is blocked trying to enter a saturated VMEM pipeline rather than waiting for its own data to return.",
+      "category": "vmem-issue",
+      "confidence": 0.96,
+      "suggestion": "Split each future B half-load pair around the two current MFMAs: consume current half 0, issue future half 0, consume current half 1, then issue future half 1. This preserves prefetch distance while smoothing VMEM issue pressure.",
+      "metric": 9936,
+      "anchor": {
+        "instIdxs": [648, 691, 744, 879, 1335, 1339],
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [164000, 181500]
+      }
+    },
+    {
+      "id": "kloop-vmcnt-barriers",
+      "severity": "high",
+      "title": "24 K-loop vmcnt(10) waits add 54.5k traced stall cycles",
+      "note": "Each K tile reaches an s_waitcnt vmcnt(10) followed by a workgroup barrier before consuming the next LDS A tile. Across the 24 static waits, the trace reports 54,532 aggregate stall cycles, or about 13.6k per long wave. Representative spikes are idx 897 (5,720 cycles), idx 944 (5,148), idx 1046 (4,472), and idx 998 (2,796). Increasing the global B-stage depth was already tested and was not robust at M=16, so the remaining opportunity is load cadence within the existing two-stage pipeline.",
+      "category": "mem-wait",
+      "confidence": 0.94,
+      "suggestion": "Stagger B payload and B-scale issues across the current MFMAs so fewer requests arrive immediately before the vmcnt/barrier boundary.",
+      "metric": 54532,
+      "anchor": {
+        "instIdxs": [897, 944, 998, 1046, 1094, 1194, 1242, 1341],
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [181500, 201500]
+      }
+    },
+    {
+      "id": "terminal-mfma-feed-drain",
+      "severity": "high",
+      "title": "Final operand drain stalls 11.2k cycles before the last MFMAs",
+      "note": "The s_waitcnt vmcnt(1) at idx 1364 accumulates 11,212 stall cycles across the four long waves (2,803 cycles per wave). It follows the final W1 payload and scale loads at idx 1335-1340 and sits directly between the last MFMA groups. At this point there is no later K-tile work available to cover the drain, so it extends the critical path.",
+      "category": "mfma-feed",
+      "confidence": 0.98,
+      "suggestion": "Issue each final-tile B half earlier by interleaving future half-loads with the preceding current-half MFMAs. Avoid adding another full B stage, which increased register pressure without a robust M=16 gain.",
+      "metric": 11212,
+      "anchor": {
+        "instIdxs": [1335, 1336, 1339, 1340, 1364, 1365, 1366],
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [203500, 210200]
+      }
+    },
+    {
+      "id": "prequant-traffic-tradeoff",
+      "severity": "medium",
+      "title": "Prequantization removes VALU work but barely changes W1 memory misses",
+      "note": "Compared with forced f16in, the selected prequantized G1 reduces SQ_ACTIVE_INST_VALU from 2.943M to 1.003M (-65.9%) and lowers the LDS conflict ratio from 30.8% to 13.8%. However, TCC requests fall only from 2.707M to 2.667M (-1.5%) and misses from 2.657M to 2.644M (-0.5%), because W1 traffic dominates. The long-wave span is therefore 71.6k cycles versus 68.6k for f16in even though the prequantized path executes much less arithmetic.",
+      "category": "memory-traffic",
+      "confidence": 0.97,
+      "suggestion": "Focus further work on W1 request scheduling or reuse. Reducing activation-side arithmetic or LDS traffic further cannot materially reduce the dominant miss stream.",
+      "metric": 2643809,
+      "anchor": null
+    },
+    {
+      "id": "rejected-second-wave",
+      "severity": "medium",
+      "title": "The second resident candidate exits after 1.3k cycles, leaving no latency-hiding wave",
+      "note": "Every SIMD shows one useful wave lasting about 71.6k cycles and a second candidate wave lasting only 1.27-1.28k cycles before rejecting its padded expert block. After that rejection, the useful wave runs alone while spending most of its time stalled. This is dispatch imbalance rather than an LDS-bank bottleneck.",
+      "category": "occupancy",
+      "confidence": 0.9,
+      "suggestion": "A compact or persistent work queue that assigns only valid expert/N tiles could place a second useful workgroup on more CUs and hide VMEM issue stalls. The current max-grid candidate dispatch cannot guarantee that.",
+      "metric": 70300,
+      "anchor": {
+        "wave": {
+          "se": 0,
+          "sm": 0,
+          "slot": 0
+        },
+        "time": [141200, 207000]
+      }
+    }
+  ]
+}

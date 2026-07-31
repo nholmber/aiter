@@ -20,11 +20,12 @@ WaveScope/ATT analysis of the deterministic shared-expert GLM-5.2 TP4 shape:
 - Captured dispatch: iteration 4 after three complete pipeline warmups
 - PMC sidecar: TCC hit/miss, LDS active/conflict, active VALU, and GUI active
 
-The workload harness is `capture_m16.py`. For example, from the repository
-root inside the development container:
+The workload harness is `capture_m16.py`. `ATT_MODE` accepts `ours`,
+`f16in`, or `quant_once`. For example, from the repository root inside the
+development container:
 
 ```bash
-ATT_MODE=ours PYTHONPATH=/workspace/aiter \
+ATT_MODE=quant_once PYTHONPATH=/workspace/aiter \
   python docs/benchmarks/wavescope_glm52_m16/capture_m16.py
 ```
 
@@ -36,6 +37,7 @@ The decoded trace folders are stored outside the git repository:
 | Trace | Decode folder |
 |---|---|
 | Selected compact-route GEMM1 | `/data/wavescope-att/ours-g1-compact-steady/ui_output_agent_48380_dispatch_203` |
+| Selected fused-sort-quant/prequantized GEMM1 | `/data/wavescope-att/quantonce-g1-steady/ui_output_agent_9542_dispatch_207` |
 | Selected grouped GEMM2 | `/data/wavescope-att/ours-g2-grouped-steady/ui_output_agent_56094_dispatch_204` |
 | Superseded route-private GEMM1 | `/data/wavescope-att/ours-g1-steady/ui_output_agent_14178_dispatch_203` |
 | Superseded token-wave GEMM2 | `/data/wavescope-att/ours-g2-steady/ui_output_agent_39561_dispatch_204` |
@@ -51,6 +53,7 @@ bottleneck rules.
 | Kernel | Workgroups | WG/CU | VGPR | LDS |
 |---|---:|---:|---:|---:|
 | Selected compact-route GEMM1 | 272 | 1.06 | 56 | 12 KiB |
+| Selected prequantized BN256 GEMM1 | 576 | 2.25 | 72 | 16 KiB |
 | Forced `f16in` GEMM1 | 576 | 2.25 | 64 | 16 KiB |
 | Selected grouped GEMM2 | 3096 | 12.09 | 48 | 20 KiB |
 | Superseded token-wave GEMM2 | 792 | 3.09 | 64 | 20 KiB |
@@ -68,6 +71,7 @@ baseline candidates.
 | Kernel | Active wave duration | Max overlapping waves/SIMD | EXEC | WAIT | STALL |
 |---|---:|---:|---:|---:|---:|
 | Selected compact-route GEMM1 | 113.0k cycles | 1 | 10.34% | 88.36% | 1.28% |
+| Selected prequantized BN256 GEMM1 | 71.6k cycles | 2 briefly | 9.97% | 32.42% | 57.56% |
 | Superseded route-private GEMM1 | 105.7k cycles | 1 | 10.54% | 88.35% | 1.08% |
 | Forced `f16in` GEMM1 | 68.6k cycles | 2 briefly | 17.21% | 56.69% | 26.05% |
 | Selected grouped GEMM2 | 20.3k cycles | 5 | 6.23% | 58.31% | 35.31% |
@@ -84,6 +88,7 @@ left.
 | Kernel | TCC requests | TCC misses | L2 hit rate | LDS conflict ratio |
 |---|---:|---:|---:|---:|
 | Selected compact-route GEMM1 | 3.429M | 2.879M | 16.04% | 4.95% |
+| Selected prequantized BN256 GEMM1 | 2.667M | 2.644M | 0.87% | 13.79% |
 | Superseded route-private GEMM1 | 3.427M | 2.869M | 16.29% | 4.95% |
 | Forced `f16in` GEMM1 | 2.707M | 2.657M | 1.83% | 44.44% |
 | Selected grouped GEMM2 | 1.447M | 1.378M | 4.79% | 63.75% |
@@ -137,6 +142,64 @@ the route-private traffic excess:
 - Superseded route-private GEMM2 requests: 1.758M.
 
 The remaining full-M=16 gap is now entirely GEMM1.
+
+## Fused-sort-quant/prequantized G1 follow-up
+
+The selected M=16 path now uses:
+
+- shared-aware fused sort, output zero, and one-time token quantization;
+- `gemm1_a4w4_port_h6144_i512_ne257_bm16_nt_sep_xcd4_dts`;
+- BN256 atomic GEMM2.
+
+The fresh G1 ATT capture and PMC sidecar are colocated in:
+
+`/data/wavescope-att/quantonce-g1-steady/ui_output_agent_9542_dispatch_207`
+
+This follow-up used physical GPU 2, target CU/WGP 1, shader engine 0, and the
+same 96 MiB ATT buffer and fourth-invocation steady-state selection.
+
+WaveScope annotations are in that folder and mirrored in
+`quantonce_g1_annotations.json`.
+
+### What changed versus forced `f16in`
+
+- VALU activity falls from 2.943M to 1.003M instructions (-65.9%).
+- The LDS conflict ratio falls from 30.77% to 13.79%.
+- TCC requests fall only 1.5%, from 2.707M to 2.667M.
+- TCC misses fall only 0.5%, from 2.657M to 2.644M.
+- The long wave grows from 68.6k to 71.6k cycles.
+- Explicit WAIT falls from 56.7% to 32.4%, but issue STALL rises from 26.1%
+  to 57.6%.
+
+Removing inline quantization therefore eliminates substantial arithmetic and
+LDS work, but does not materially change the dominant W1 miss stream. The
+compiler reaches future W1 payload loads faster and attempts to issue them into
+an already saturated VMEM pipeline.
+
+### Dominant stalls
+
+The highest-confidence findings are:
+
+1. Future W1 `buffer_load_dwordx4` instructions are issue-blocked. Static
+   instruction 648 accumulates 9,936 stall cycles across four traced waves;
+   instructions 744, 691, and 879 add 5,700, 5,416, and 4,476 cycles.
+2. The 24 `s_waitcnt vmcnt(10)` K-loop boundaries accumulate 54,532 stall
+   cycles across the four waves.
+3. The terminal `s_waitcnt vmcnt(1)` at instruction 1364 adds 11,212 cycles
+   before the final MFMA group, approximately 2.8k cycles per wave.
+4. The second candidate wave on each SIMD rejects its padded expert block
+   after roughly 1.3k cycles, leaving the useful wave alone for the remaining
+   ~70k cycles.
+
+Two schedule changes derived from the trace were implemented and rejected:
+
+- interleaving future W1 half-loads between the two current MFMAs regressed;
+- spreading the two B-scale loads after their last current consumers moved
+  graph time by only -0.09 to +0.29 us across seeds, below the keep threshold.
+
+The trace closes simple instruction reordering as a meaningful M=16 lever.
+Further improvement requires either W1 reuse or a compact/persistent dispatch
+that places a second useful workgroup on more CUs.
 
 ## Primary bottlenecks
 

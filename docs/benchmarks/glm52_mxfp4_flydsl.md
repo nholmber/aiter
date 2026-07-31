@@ -1206,6 +1206,36 @@ quant CTAs and output-zero CTAs finish under the single sorting CTA. The G1
 win comes from halving activation payload bytes and caching each compact
 block's scale operand in LDS. G2 is unchanged.
 
+#### Fresh WaveScope/ATT analysis of selected M=16 G1
+
+The selected prequantized BN256/XCD4 G1 was captured directly:
+
+`/data/wavescope-att/quantonce-g1-steady/ui_output_agent_9542_dispatch_207`
+
+Kernel resources are 72 VGPR, 16 KiB LDS, 256 threads, and a 576-workgroup
+candidate grid. The trace includes `annotations.json` and the six-counter PMC
+sidecar.
+
+Compared with forced `f16in`:
+
+- VALU activity is 65.9% lower.
+- LDS conflict ratio falls from 30.77% to 13.79%.
+- TCC requests fall only 1.5% and TCC misses only 0.5%.
+- The useful wave lasts 71.6k cycles versus 68.6k for `f16in`.
+- WAIT falls from 56.7% to 32.4%, while instruction issue STALL rises from
+  26.1% to 57.6%.
+
+The prequantized kernel reaches its future W1 loads with much less independent
+arithmetic between them. Paired `buffer_load_dwordx4` instructions become
+issue-blocked by a saturated VMEM pipeline. The 24 K-loop
+`s_waitcnt vmcnt(10)` boundaries accumulate 54,532 traced stall cycles, and
+the final `s_waitcnt vmcnt(1)` contributes another 11,212 cycles before the
+last MFMA group.
+
+Payload-half staggering regressed. Separating the two B-scale loads produced
+only -0.09 to +0.29 us graph movement across seeds, below the keep threshold.
+The selected schedule is unchanged.
+
 #### Selective direct-scale pipelining
 
 The initial direct-scale implementation gathered all 24 K-tile scale operands
