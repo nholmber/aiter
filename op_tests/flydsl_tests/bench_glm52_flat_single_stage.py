@@ -800,15 +800,23 @@ def main():
                     (256, False, 8),
                     (256, True, 1),
                     (256, True, 4),
+                    (512, True, 0),
+                    (512, True, 1),
                 ]
             elif args.bm16_sweep:
                 bm16_candidates.extend(
-                    (bn, use_nt, 0) for bn in (128, 64) for use_nt in (True, False)
+                    (bn, use_nt, 0)
+                    for bn in (512, 128, 64)
+                    for use_nt in (True, False)
                 )
                 bm16_candidates.extend(
                     (256, use_nt, xcd_swizzle)
                     for xcd_swizzle in (1, 2, 4, 8)
                     for use_nt in (True, False)
+                )
+                bm16_candidates.extend(
+                    (512, True, xcd_swizzle)
+                    for xcd_swizzle in (1, 2, 4, 8)
                 )
 
             for bn, use_nt, xcd_swizzle in bm16_candidates:
@@ -864,6 +872,7 @@ def main():
                 selected_candidate = (
                     (not use_nt and xcd_swizzle == 8)
                     or (use_nt and xcd_swizzle in (1, 4))
+                    or (bn == 512 and use_nt and xcd_swizzle == 0)
                 )
                 if args.graph_replays and selected_candidate:
                     quant_graph = torch.cuda.CUDAGraph()

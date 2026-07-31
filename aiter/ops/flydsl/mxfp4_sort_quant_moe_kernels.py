@@ -119,10 +119,22 @@ def flydsl_mxfp4_sort_quant_moe(
         MB=BM,
     )
 
-    # Cached W1 wins through the rounded M=8 bucket. The M=16 bucket prefers
-    # non-temporal W1; a wider XCD group starts winning once M reaches 10.
+    # Cached BN256 wins through the rounded M=8 bucket. M=10-14 has enough
+    # compact expert blocks for BN512 while still benefiting from halving the
+    # repeated A/scale traffic. At M=15-16, BN512 loses its parallelism edge.
     stage1_use_nt = M >= 9
-    stage1_xcd = 8 if not stage1_use_nt else (1 if M == 9 else 4)
+    if M <= 8:
+        stage1_bn = 256
+        stage1_xcd = 8
+    elif M == 9:
+        stage1_bn = 256
+        stage1_xcd = 1
+    elif M <= 14:
+        stage1_bn = 512
+        stage1_xcd = 0
+    else:
+        stage1_bn = 256
+        stage1_xcd = 4
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale,
@@ -142,7 +154,7 @@ def flydsl_mxfp4_sort_quant_moe(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         topk=TOPK,
-        BN=256,
+        BN=stage1_bn,
         BK=256,
         xcd_swizzle=stage1_xcd,
         direct_token_scales=True,

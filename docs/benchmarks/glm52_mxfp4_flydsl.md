@@ -1148,7 +1148,8 @@ The public GLM-5.2 specialized dispatch now selects:
 - M=3–4: deterministic shared-hybrid
 - M=5–8: fused sort+quant, cached W1, XCD=8
 - M=9: fused sort+quant, non-temporal W1, XCD=1
-- M=10–16: fused sort+quant, non-temporal W1, XCD=4
+- M=10–14: fused sort+quant, BN512 non-temporal W1, XCD=0
+- M=15–16: fused sort+quant, BN256 non-temporal W1, XCD=4
 
 The M=5–16 path remains guarded by `AITER_GLM52_FUSED_MOE=1` and the existing
 min/max-M environment variables.
@@ -1166,11 +1167,11 @@ the upstream BM16 `f16in` G1 plus BM16 atomic G2.
 | 7 | 58.601 | 55.019 | -6.11% |
 | 8 | 60.015 | 58.533 | -2.47% |
 | 9 | 62.289 | 60.285 | -3.22% |
-| 10 | 77.875 | 77.087 | -1.01% |
-| 11 | 79.911 | 79.681 | -0.29% |
-| 12 | 81.614 | 81.241 | -0.46% |
-| 13 | 84.855 | 83.654 | -1.42% |
-| 14 | 87.498 | 87.038 | -0.53% |
+| 10 | 77.546 | 70.928 | -8.53% |
+| 11 | 81.287 | 77.048 | -5.21% |
+| 12 | 82.568 | 78.148 | -5.35% |
+| 13 | 84.804 | 81.912 | -3.41% |
+| 14 | 87.747 | 84.777 | -3.38% |
 | 15 | 88.626 | 87.870 | -0.85% |
 | 16 | 89.732 | 88.780 | -1.06% |
 
@@ -1224,6 +1225,33 @@ The average improvement was approximately 0.43 us, or 0.7%. M=16 was neutral
 across the same checks and one seed regressed, so scale pipelining is enabled
 only for M=5–8. M>=9 retains the all-scales preload schedule.
 
+#### BN512 mid-bucket G1
+
+The BM16 G1 epilogue was extended to BN512:
+
+- Each wave computes eight 16-column gate/up roles.
+- Four B-scale dwords cover the two 32-column groups owned by each wave.
+- The 256-thread epilogue emits two 128-column activated halves.
+- The compact expert grid uses two G1 N workgroups instead of four, halving
+  repeated activation and token-scale traffic.
+
+BN512 is selected only for actual M=10–14. It underfills at M=9, loses its
+parallelism advantage at M=15, and is neutral/noisy at M=16.
+
+Same-process graph comparisons against the best BN256 candidate produced the
+following average savings across the measured seeds:
+
+| Actual M | Average BN512 graph saving |
+|---:|---:|
+| 10 | approximately 3.70 us |
+| 11 | approximately 3.33 us |
+| 12 | approximately 3.89 us |
+| 13 | approximately 2.41 us |
+| 14 | approximately 1.41 us |
+
+All BN512 normalized differences remained around `5e-6`, matching the BN256
+path.
+
 ### Rejected follow-ups
 
 - Direct per-MFMA token-scale loads were correct but duplicated scale traffic
@@ -1237,7 +1265,7 @@ only for M=5–8. M>=9 retains the all-scales preload schedule.
 - Collapsing `sorted_token_ids`, `m_indices`, and `reverse_sorted` into one
   plain token-ID array removed unused metadata stores but did not improve the
   preparation launch and slightly regressed the clean M=16 graph comparison.
-- G1 BN128 and BN64 both lost at M=16. BN256 remains selected.
+- G1 BN128 and BN64 both lost. BN512 is useful only for M=10–14.
 - XCD changes are sub-microsecond, but graph sweeps consistently favored XCD8
   for the cached M<=8 bucket and XCD4 near the top of the M=16 bucket.
 

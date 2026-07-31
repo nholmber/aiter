@@ -198,6 +198,10 @@ def _gemm1_body(
     NJ = max(1, (BN // NWAVES) // 16)
     N_COL_GROUPS = BN // 16
     N_SCALE_GROUPS = BN // 64
+    N_EPILOG_PARTS = (N_COL_GROUPS + 15) // 16
+    N_B_SCALE_REGS = (
+        2 if interleave or BN in (64, 128) else 2 * max(1, BN // 256)
+    )
     b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
 
@@ -354,11 +358,23 @@ def _gemm1_body(
     else:
         if const_expr(BN == 128):
             np_gate = n_block_idx * fx.Int32(2) + wave // fx.Int32(2)
+            np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
         else:
-            np_gate = n_block_idx * fx.Int32(BN // 64) + wave
-        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
+            groups_per_wave = max(1, BN // 256)
+            np_gate = (
+                n_block_idx * fx.Int32(BN // 64)
+                + wave * fx.Int32(groups_per_wave)
+            )
+            np_list = []
+            for scale_group in range_constexpr(groups_per_wave):
+                np_list.append(np_gate + fx.Int32(scale_group))
+                np_list.append(
+                    np_gate
+                    + fx.Int32(scale_group)
+                    + fx.Int32(N_OUT // 64)
+                )
     b_scale_s_base, b_scale_s_base_hi = [], []
-    for mw in range_constexpr(2):
+    for mw in range_constexpr(N_B_SCALE_REGS):
         base = (
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
@@ -368,7 +384,7 @@ def _gemm1_body(
 
     accm = [[None] * NJ for _ in range(kMChunks)]
     b = [[[None, None] for _ in range(NJ)] for _ in range(kStages)]
-    b_scale_v = [[None, None] for _ in range(kStages)]
+    b_scale_v = [[None] * N_B_SCALE_REGS for _ in range(kStages)]
 
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
@@ -700,7 +716,7 @@ def _gemm1_body(
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
         imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
-        for mw in range_constexpr(2):
+        for mw in range_constexpr(N_B_SCALE_REGS):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
             r = fx.make_rmem_tensor(bscale_reg_lay, fx.Int32)
@@ -754,8 +770,8 @@ def _gemm1_body(
             mni = J // 2
             in_b = J % 2
         else:
-            mni = J % 2
-            in_b = J // 2
+            mni = (J // 4) * 2 + J % 2
+            in_b = (J % 4) // 2
         sb = bs_slot[mni]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
         if const_expr(kMChunks == 1):
@@ -966,79 +982,94 @@ def _gemm1_body(
     n_lane = tx_i32 % fx.Int32(16)
     wave_grp = n_lane // fx.Int32(4)
     kk = n_lane % fx.Int32(4)
-    n_lane_valid = n_lane < fx.Int32(N_COL_GROUPS)
-    safe_n_lane = n_lane_valid.select(n_lane, fx.Int32(0))
 
     aqout_layout = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
     # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
     aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
-    scales_per_mr = [None] * M_REPS
+    scales_per_mr = [
+        [None] * N_EPILOG_PARTS for _ in range(M_REPS)
+    ]
 
     for mr in range_constexpr(M_REPS):
         row_local = fx.Int32(mr * 16) + m_lane
+        for epilog_part in range_constexpr(N_EPILOG_PARTS):
+            n_group = n_lane + fx.Int32(epilog_part * 16)
+            n_group_valid = n_group < fx.Int32(N_COL_GROUPS)
+            safe_n_group = n_group_valid.select(n_group, fx.Int32(0))
 
-        gate_vs = [None] * 8
-        up_vs = [None] * 8
-        for ee in range_constexpr(8):
-            gate_col = safe_n_lane * fx.Int32(8) + fx.Int32(ee)
-            up_col = fx.Int32(BN_INT) + gate_col
-            gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
-            up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _silu_mul_batch(gate_vs, up_vs)
+            gate_vs = [None] * 8
+            up_vs = [None] * 8
+            for ee in range_constexpr(8):
+                gate_col = safe_n_group * fx.Int32(8) + fx.Int32(ee)
+                up_col = fx.Int32(BN_INT) + gate_col
+                gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
+                up_vs[ee] = acc_load(acc_idx(row_local, up_col))
+            result = _silu_mul_batch(gate_vs, up_vs)
 
-        local_max = _fabs_f32(result[0])
-        for ee in range_constexpr(1, 8):
-            local_max = local_max.maximumf(_fabs_f32(result[ee]))
-        lm_i = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
-        local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
-
-        e8m0, qscale = _e8m0_from_amax(local_max)
-        scales_per_mr[mr] = e8m0
-
-        packed_i32 = _raw(fx.Int32(0))
-        qscale_raw = _raw(qscale)
-        for w in range_constexpr(4):
-            packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                packed_i32,
-                _raw(result[2 * w]),
-                _raw(result[2 * w + 1]),
-                qscale_raw,
-                w,
+            local_max = _fabs_f32(result[0])
+            for ee in range_constexpr(1, 8):
+                local_max = local_max.maximumf(_fabs_f32(result[ee]))
+            lm_i = _inline_dpp_quad_amax(
+                fx.Int32(_raw(local_max).bitcast(T.i32))
             )
-        packed = fx.Int32(packed_i32)
+            local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
 
-        byte_pos = n_block_idx * fx.Int32(BN // 4) + safe_n_lane * fx.Int32(4)
-        if const_expr(mapped_output):
-            output_row = cached_output_rows_inline[mr]
-            out_row = output_row * fx.Int32(output_block_stride * BM)
-        else:
-            output_row = None
-            out_row = m_row + row_local
-        if const_expr(local_aq_base_i32 is not None):
-            local_base = _lds_ptr3(local_aq_base_i32, fx.Int32(0))
-            local_off = (
-                row_local * fx.Int32(local_aq_row_bytes)
-                + (n_block_idx & fx.Int32(1)) * fx.Int32(local_aq_row_bytes // 2)
-                + safe_n_lane * fx.Int32(4)
+            e8m0, qscale = _e8m0_from_amax(local_max)
+            scales_per_mr[mr][epilog_part] = e8m0
+
+            packed_i32 = _raw(fx.Int32(0))
+            qscale_raw = _raw(qscale)
+            for w in range_constexpr(4):
+                packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32,
+                    packed_i32,
+                    _raw(result[2 * w]),
+                    _raw(result[2 * w + 1]),
+                    qscale_raw,
+                    w,
+                )
+            packed = fx.Int32(packed_i32)
+
+            byte_pos = (
+                n_block_idx * fx.Int32(BN // 4)
+                + safe_n_group * fx.Int32(4)
             )
-            if n_lane_valid:
-                llvm.StoreOp(_raw(packed), _gep3(local_base, local_off))
-        else:
-            store_off = _layout_idx(aqout_layout, out_row, byte_pos)
             if const_expr(mapped_output):
-                if (output_row < fx.Int32(output_row_limit)) & n_lane_valid:
-                    _scalar_store(
-                        aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32
-                    )
+                output_row = cached_output_rows_inline[mr]
+                out_row = output_row * fx.Int32(output_block_stride * BM)
             else:
-                if n_lane_valid:
-                    _scalar_store(
-                        aqout_tiles,
-                        store_off // fx.Int32(4),
-                        packed,
-                        fx.Int32,
-                    )
+                output_row = None
+                out_row = m_row + row_local
+            if const_expr(local_aq_base_i32 is not None):
+                local_base = _lds_ptr3(local_aq_base_i32, fx.Int32(0))
+                local_off = (
+                    row_local * fx.Int32(local_aq_row_bytes)
+                    + (n_block_idx & fx.Int32(1))
+                    * fx.Int32(local_aq_row_bytes // 2)
+                    + safe_n_group * fx.Int32(4)
+                )
+                if n_group_valid:
+                    llvm.StoreOp(_raw(packed), _gep3(local_base, local_off))
+            else:
+                store_off = _layout_idx(aqout_layout, out_row, byte_pos)
+                if const_expr(mapped_output):
+                    if (
+                        output_row < fx.Int32(output_row_limit)
+                    ) & n_group_valid:
+                        _scalar_store(
+                            aqout_tiles,
+                            store_off // fx.Int32(4),
+                            packed,
+                            fx.Int32,
+                        )
+                else:
+                    if n_group_valid:
+                        _scalar_store(
+                            aqout_tiles,
+                            store_off // fx.Int32(4),
+                            packed,
+                            fx.Int32,
+                        )
 
     # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
     ascaleout_layout = fx.make_layout(
@@ -1046,37 +1077,79 @@ def _gemm1_body(
     )
     ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
     ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
-    if (kk == fx.Int32(0)) & (wave_grp < fx.Int32(N_SCALE_GROUPS)):
-        scale_group = n_block_idx * fx.Int32(N_SCALE_GROUPS) + wave_grp
-        ku = scale_group >> fx.Int32(3)
-        ikxdl = (scale_group >> fx.Int32(2)) & fx.Int32(1)
-        lane_grp = scale_group & fx.Int32(3)
-        if const_expr(BM == 16):
-            if const_expr(mapped_output):
-                output_row = cached_output_rows_inline[0]
-                chunk = output_row * fx.Int32(output_block_stride)
-                dword_off = _layout_idx(
-                    ascaleout_layout, chunk, ku, lane_grp, fx.Int32(0)
-                )
-                addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-                if output_row < fx.Int32(output_row_limit):
-                    _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
+    for epilog_part in range_constexpr(N_EPILOG_PARTS):
+        scale_wave_grp = wave_grp + fx.Int32(epilog_part * 4)
+        if (kk == fx.Int32(0)) & (
+            scale_wave_grp < fx.Int32(N_SCALE_GROUPS)
+        ):
+            scale_group = (
+                n_block_idx * fx.Int32(N_SCALE_GROUPS)
+                + scale_wave_grp
+            )
+            ku = scale_group >> fx.Int32(3)
+            ikxdl = (scale_group >> fx.Int32(2)) & fx.Int32(1)
+            lane_grp = scale_group & fx.Int32(3)
+            if const_expr(BM == 16):
+                if const_expr(mapped_output):
+                    output_row = cached_output_rows_inline[0]
+                    chunk = output_row * fx.Int32(output_block_stride)
+                    dword_off = _layout_idx(
+                        ascaleout_layout,
+                        chunk,
+                        ku,
+                        lane_grp,
+                        fx.Int32(0),
+                    )
+                    addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                    if output_row < fx.Int32(output_row_limit):
+                        _scalar_store(
+                            ascaleout_i8_tiles,
+                            addr,
+                            scales_per_mr[0][epilog_part],
+                            fx.Int8,
+                        )
+                else:
+                    chunk = m_block_idx
+                    dword_off = _layout_idx(
+                        ascaleout_layout,
+                        chunk,
+                        ku,
+                        lane_grp,
+                        m_lane,
+                    )
+                    addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                    _scalar_store(
+                        ascaleout_i8_tiles,
+                        addr,
+                        scales_per_mr[0][epilog_part],
+                        fx.Int8,
+                    )
             else:
-                chunk = m_block_idx
-                dword_off = _layout_idx(ascaleout_layout, chunk, ku, lane_grp, m_lane)
-                addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-                _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
-        else:
-            for sub in range_constexpr(kSubBlocks):
-                chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
-                dword_off = _layout_idx(ascaleout_layout, chunk, ku, lane_grp, m_lane)
-                pair_i32 = scales_per_mr[sub * 2 + 0] | (
-                    scales_per_mr[sub * 2 + 1] << fx.Int32(8)
-                )
-                addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-                _scalar_store(
-                    ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
-                )
+                for sub in range_constexpr(kSubBlocks):
+                    chunk = (
+                        m_block_idx * fx.Int32(kSubBlocks)
+                        + fx.Int32(sub)
+                    )
+                    dword_off = _layout_idx(
+                        ascaleout_layout,
+                        chunk,
+                        ku,
+                        lane_grp,
+                        m_lane,
+                    )
+                    pair_i32 = scales_per_mr[sub * 2 + 0][
+                        epilog_part
+                    ] | (
+                        scales_per_mr[sub * 2 + 1][epilog_part]
+                        << fx.Int32(8)
+                    )
+                    addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
+                    _scalar_store(
+                        ascaleout_i16_tiles,
+                        addr // fx.Int32(2),
+                        pair_i32,
+                        fx.Int16,
+                    )
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
@@ -1125,12 +1198,19 @@ def compile_gemm1_a4w4_port(
         raise AssertionError(
             "pipelined token-scale gather requires direct_token_scales=True"
         )
+    if BN == 512 and (BM != 16 or inline_quant or interleave):
+        raise AssertionError(
+            "BN512 currently requires BM16, prequantized input, and "
+            "separated gate/up"
+        )
 
     assert (
-        BN in (64, 128, 256) and BK == 256
-    ), f"only BN in {{64,128,256}} and BK=256 supported, got BN={BN} BK={BK}"
-    if BN in (64, 128) and interleave:
-        raise AssertionError("BN64/BN128 currently support separated gate/up only")
+        BN in (64, 128, 256, 512) and BK == 256
+    ), f"only BN in {{64,128,256,512}} and BK=256 supported, got BN={BN} BK={BK}"
+    if BN in (64, 128, 512) and interleave:
+        raise AssertionError(
+            "BN64/BN128/BN512 currently support separated gate/up only"
+        )
     KH_TILE = BK // 2
     _K = D_HIDDEN
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
