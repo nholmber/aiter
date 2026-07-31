@@ -196,6 +196,10 @@ Two schedule changes derived from the trace were implemented and rejected:
 - interleaving future W1 half-loads between the two current MFMAs regressed;
 - spreading the two B-scale loads after their last current consumers moved
   graph time by only -0.09 to +0.29 us across seeds, below the keep threshold.
+- an eight-wave/512-thread BN256 workgroup placed two useful compute waves on
+  each SIMD and was numerically correct, but graph replay regressed by
+  approximately 0.17 us because the larger workgroup and duplicated epilogue
+  work outweighed the added latency hiding.
 
 The trace closes simple instruction reordering as a meaningful M=16 lever.
 Further improvement requires either W1 reuse or a compact/persistent dispatch

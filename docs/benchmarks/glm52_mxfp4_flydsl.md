@@ -1234,7 +1234,8 @@ last MFMA group.
 
 Payload-half staggering regressed. Separating the two B-scale loads produced
 only -0.09 to +0.29 us graph movement across seeds, below the keep threshold.
-The selected schedule is unchanged.
+An eight-wave/512-thread BN256 variant was also correct but regressed graph
+replay by approximately 0.17 us. The selected schedule is unchanged.
 
 #### Selective direct-scale pipelining
 
