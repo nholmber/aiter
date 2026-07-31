@@ -1271,6 +1271,12 @@ dispatchable production win.
   cannot replace the single M=16-bucket recipe.
 - A three-stage B-prefetch pipeline helped some M=9–14 cases by fractions of a
   microsecond, but was neutral or regressed M=16 on other seeds.
+- An M=16-only three-workgroup G1 geometry was implemented as
+  `384 + 384 + 256`. Both a mixed-body kernel and a uniform ragged-BN384
+  kernel were numerically correct. Six-wave and eight-wave BN384 workgroups
+  still measured approximately 66–70 us for G1 versus roughly 52 us for
+  BN256. The larger workgroup, extra B-scale handling, and ragged epilogue
+  outweighed the 25% reduction in repeated A/scale traffic.
 - XCD changes are sub-microsecond, but graph sweeps consistently favored XCD8
   for the cached M<=8 bucket and XCD4 near the top of the M=16 bucket.
 
