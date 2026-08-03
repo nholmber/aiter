@@ -28,6 +28,15 @@ from aiter.ops.flydsl.mxfp4_flat_single_stage_moe_kernels import (
 )
 from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+from aiter.ops.flydsl.mxfp4_routed_embedded_shared_moe_kernels import (
+    _get_stage1 as _get_routed_embedded_shared_stage1,
+    _get_stage2 as _get_routed_embedded_shared_stage2,
+)
+from aiter.ops.flydsl.mxfp4_routed_compact_shared_moe_kernels import (
+    _get_stage1 as _get_routed_private_grouped_stage1,
+    _get_stage2 as _get_routed_private_grouped_stage2,
+)
+from aiter.ops.flydsl import moe_kernels as _moe_kernels
 from aiter.ops.quant import mxfp4_moe_sort_fwd
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
@@ -733,6 +742,166 @@ def main():
                 run_main_gemm2()
                 return main_out
 
+            embedded_blocks = m * (TOPK - 1) + 1
+            embedded_rows = embedded_blocks * 16
+            embedded_inter_q = torch.empty(
+                (embedded_rows, INTER // 2),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            embedded_inter_scale = torch.empty(
+                (embedded_blocks * INTER,),
+                dtype=torch.uint8,
+                device=hidden.device,
+            )
+            embedded_out = torch.empty_like(out)
+            private_grouped_inter_q = torch.empty_like(embedded_inter_q)
+            private_grouped_inter_scale = torch.empty_like(embedded_inter_scale)
+            private_grouped_sorted_ids = torch.empty(
+                (m * (TOPK - 1) * 16,),
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            private_grouped_sorted_weights = torch.empty(
+                (m * (TOPK - 1) * 16,),
+                dtype=torch.float32,
+                device=hidden.device,
+            )
+            private_grouped_expert_ids = torch.empty(
+                (m * (TOPK - 1),),
+                dtype=torch.int32,
+                device=hidden.device,
+            )
+            private_grouped_counts = torch.empty_like(private_grouped_expert_ids)
+            private_grouped_out = torch.empty_like(out)
+
+            embedded_stage2 = _get_routed_embedded_shared_stage2(
+                HIDDEN,
+                INTER,
+                EXPERTS,
+                TOPK,
+                False,
+                False,
+            )
+
+            def make_embedded_shared_runner(bn, dispatch_n_groups):
+                stage1 = _get_routed_embedded_shared_stage1(
+                    HIDDEN,
+                    INTER,
+                    EXPERTS,
+                    TOPK,
+                    True,
+                    False,
+                    False,
+                    dispatch_n_groups,
+                    bn,
+                )
+
+                def run_stage1():
+                    _moe_kernels._run_compiled(
+                        stage1,
+                        (
+                            hidden.data_ptr(),
+                            w1_kernel.data_ptr(),
+                            w1_scale_kernel.data_ptr(),
+                            topk_ids.data_ptr(),
+                            embedded_inter_q.data_ptr(),
+                            embedded_inter_scale.data_ptr(),
+                            embedded_out.data_ptr(),
+                            m,
+                            torch.cuda.current_stream(),
+                        ),
+                    )
+
+                def run_stage2():
+                    _moe_kernels._run_compiled(
+                        embedded_stage2,
+                        (
+                            embedded_inter_q.data_ptr(),
+                            embedded_inter_scale.data_ptr(),
+                            w2_kernel.data_ptr(),
+                            w2_scale_kernel.data_ptr(),
+                            topk_ids.data_ptr(),
+                            topk_weights.data_ptr(),
+                            embedded_out.data_ptr(),
+                            m,
+                            torch.cuda.current_stream(),
+                        ),
+                    )
+
+                def run_all():
+                    run_stage1()
+                    run_stage2()
+                    return embedded_out
+
+                return run_stage1, run_stage2, run_all
+
+            private_grouped_stage1 = _get_routed_private_grouped_stage1(
+                HIDDEN,
+                INTER,
+                EXPERTS,
+                TOPK,
+                True,
+                False,
+                False,
+                4,
+                256,
+            )
+            private_grouped_stage2 = _get_routed_private_grouped_stage2(
+                HIDDEN,
+                INTER,
+                EXPERTS,
+                TOPK,
+                False,
+                False,
+                0,
+            )
+
+            def run_private_grouped_stage1():
+                _moe_kernels._run_compiled(
+                    private_grouped_stage1,
+                    (
+                        hidden.data_ptr(),
+                        w1_kernel.data_ptr(),
+                        w1_scale_kernel.data_ptr(),
+                        topk_ids.data_ptr(),
+                        topk_weights.data_ptr(),
+                        private_grouped_inter_q.data_ptr(),
+                        private_grouped_inter_scale.data_ptr(),
+                        private_grouped_sorted_ids.data_ptr(),
+                        private_grouped_sorted_weights.data_ptr(),
+                        private_grouped_expert_ids.data_ptr(),
+                        private_grouped_counts.data_ptr(),
+                        private_grouped_out.data_ptr(),
+                        m,
+                        torch.cuda.current_stream(),
+                    ),
+                )
+
+            def run_private_grouped_stage2():
+                _moe_kernels._run_compiled(
+                    private_grouped_stage2,
+                    (
+                        private_grouped_inter_q.data_ptr(),
+                        private_grouped_inter_scale.data_ptr(),
+                        w2_kernel.data_ptr(),
+                        w2_scale_kernel.data_ptr(),
+                        topk_weights.data_ptr(),
+                        private_grouped_sorted_ids.data_ptr(),
+                        private_grouped_sorted_weights.data_ptr(),
+                        private_grouped_expert_ids.data_ptr(),
+                        private_grouped_counts.data_ptr(),
+                        private_grouped_out.data_ptr(),
+                        m,
+                        torch.cuda.current_stream(),
+                    ),
+                )
+
+            def run_private_grouped():
+                run_private_grouped_stage1()
+                run_private_grouped_stage2()
+                return private_grouped_out
+
             main_us = elapsed_us(
                 run_main_f16in,
                 args.warmup,
@@ -786,6 +955,116 @@ def main():
                     f"diff={normalized_diff(reference, main_graph_out):.8e}"
                 )
 
+            for embedded_bn, embedded_groups in ((256, 4),):
+                (
+                    run_embedded_stage1,
+                    run_embedded_stage2,
+                    run_embedded_all,
+                ) = make_embedded_shared_runner(
+                    embedded_bn,
+                    embedded_groups,
+                )
+                embedded_us = elapsed_us(
+                    run_embedded_all,
+                    args.warmup,
+                    args.iterations,
+                )
+                embedded_result = run_embedded_all()
+                torch.cuda.synchronize()
+                embedded_diff = normalized_diff(
+                    reference,
+                    embedded_result,
+                )
+                embedded_g1_us = elapsed_us(
+                    run_embedded_stage1,
+                    args.warmup,
+                    args.iterations,
+                )
+                run_embedded_stage1()
+                embedded_g2_us = elapsed_us(
+                    run_embedded_stage2,
+                    args.warmup,
+                    args.iterations,
+                )
+                print(
+                    "  embedded-shared-"
+                    f"bn{embedded_bn}-ng{embedded_groups}: "
+                    f"{embedded_us:.3f} us "
+                    f"diff_vs_ref={embedded_diff:.8e}"
+                )
+                print(
+                    "    stages: "
+                    f"g1={embedded_g1_us:.3f} us "
+                    f"g2={embedded_g2_us:.3f} us "
+                    f"sum={embedded_g1_us + embedded_g2_us:.3f} us"
+                )
+                if args.graph_replays:
+                    embedded_graph = torch.cuda.CUDAGraph()
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(embedded_graph):
+                        embedded_graph_out = run_embedded_all()
+                    embedded_graph_us = elapsed_us(
+                        embedded_graph.replay,
+                        args.warmup,
+                        args.iterations,
+                    )
+                    embedded_graph.replay()
+                    torch.cuda.synchronize()
+                    print(
+                        f"    graph replay: {embedded_graph_us:.3f} us "
+                        f"diff={normalized_diff(reference, embedded_graph_out):.8e}"
+                    )
+
+            private_grouped_us = elapsed_us(
+                run_private_grouped,
+                args.warmup,
+                args.iterations,
+            )
+            private_grouped_result = run_private_grouped()
+            torch.cuda.synchronize()
+            private_grouped_diff = normalized_diff(
+                reference,
+                private_grouped_result,
+            )
+            private_grouped_g1_us = elapsed_us(
+                run_private_grouped_stage1,
+                args.warmup,
+                args.iterations,
+            )
+            run_private_grouped_stage1()
+            private_grouped_g2_us = elapsed_us(
+                run_private_grouped_stage2,
+                args.warmup,
+                args.iterations,
+            )
+            print(
+                "  embedded-private-grouped: "
+                f"{private_grouped_us:.3f} us "
+                f"diff_vs_ref={private_grouped_diff:.8e}"
+            )
+            print(
+                "    stages: "
+                f"g1={private_grouped_g1_us:.3f} us "
+                f"g2={private_grouped_g2_us:.3f} us "
+                f"sum={private_grouped_g1_us + private_grouped_g2_us:.3f} us"
+            )
+            if args.graph_replays:
+                private_grouped_graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                with torch.cuda.graph(private_grouped_graph):
+                    private_grouped_graph_out = run_private_grouped()
+                private_grouped_graph_us = elapsed_us(
+                    private_grouped_graph.replay,
+                    args.warmup,
+                    args.iterations,
+                )
+                private_grouped_graph.replay()
+                torch.cuda.synchronize()
+                print(
+                    f"    graph replay: {private_grouped_graph_us:.3f} us "
+                    f"diff={normalized_diff(reference, private_grouped_graph_out):.8e}"
+                )
+
             sort_quant_us = elapsed_us(
                 run_bm16_sort_quant,
                 args.warmup,
@@ -805,9 +1084,7 @@ def main():
                 ]
             elif args.bm16_sweep:
                 bm16_candidates.extend(
-                    (bn, use_nt, 0)
-                    for bn in (512, 128, 64)
-                    for use_nt in (True, False)
+                    (bn, use_nt, 0) for bn in (512, 128, 64) for use_nt in (True, False)
                 )
                 bm16_candidates.extend(
                     (256, use_nt, xcd_swizzle)
@@ -815,8 +1092,7 @@ def main():
                     for use_nt in (True, False)
                 )
                 bm16_candidates.extend(
-                    (512, True, xcd_swizzle)
-                    for xcd_swizzle in (1, 2, 4, 8)
+                    (512, True, xcd_swizzle) for xcd_swizzle in (1, 2, 4, 8)
                 )
 
             for bn, use_nt, xcd_swizzle in bm16_candidates:
@@ -869,9 +1145,8 @@ def main():
                     f"g2={gemm2_us:.3f} us "
                     f"sum={stage_sum_us:.3f} us"
                 )
-                selected_candidate = (
-                    (not use_nt and xcd_swizzle == 8)
-                    or (use_nt and xcd_swizzle in (1, 4))
+                selected_candidate = (not use_nt and xcd_swizzle == 8) or (
+                    use_nt and xcd_swizzle in (1, 4)
                 )
                 if args.graph_replays and selected_candidate:
                     quant_graph = torch.cuda.CUDAGraph()

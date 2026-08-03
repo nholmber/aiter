@@ -82,20 +82,16 @@ def flydsl_mxfp4_routed_compact_shared_moe(
     stage2_dispatch_n_groups=0,
     stream=None,
 ):
-    """Sparse contiguous routed blocks plus one grouped shared block."""
+    """Route-private GEMM1 plus grouped routed/shared GEMM2."""
     M, D_HIDDEN = hidden_states.shape
     D_INTER = w1.shape[1] // 2
     NE = w1.shape[0]
     TOPK = topk_ids.shape[1]
     BM = 16
     if M < 1 or M > BM:
-        raise ValueError(
-            f"routed-compact/shared path supports 1 <= M <= {BM}, got {M}"
-        )
+        raise ValueError(f"routed-compact/shared path supports 1 <= M <= {BM}, got {M}")
     if TOPK < 2:
-        raise ValueError(
-            "routed-compact/shared path requires TOPK >= 2"
-        )
+        raise ValueError("routed-compact/shared path requires TOPK >= 2")
     if D_HIDDEN % 256 != 0 or D_INTER % 256 != 0:
         raise ValueError(
             "routed-compact/shared path requires dimensions divisible by 256"
@@ -107,6 +103,8 @@ def flydsl_mxfp4_routed_compact_shared_moe(
 
     routed_topk = TOPK - 1
     num_routed = M * routed_topk
+    if num_routed > 255:
+        raise ValueError("private grouped route metadata uses an 8-bit route index")
     max_m_blocks = num_routed + 1
     max_rows = max_m_blocks * BM
     if out is None:
@@ -134,9 +132,7 @@ def flydsl_mxfp4_routed_compact_shared_moe(
     expert_ids = torch.empty(
         (num_routed,), dtype=torch.int32, device=hidden_states.device
     )
-    counts = torch.empty(
-        (num_routed,), dtype=torch.int32, device=hidden_states.device
-    )
+    counts = torch.empty((num_routed,), dtype=torch.int32, device=hidden_states.device)
 
     hidden_states = hidden_states.contiguous()
     w1 = w1.contiguous()

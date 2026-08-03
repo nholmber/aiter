@@ -724,6 +724,30 @@ def fused_moe_(
                 topk_ids=topk_ids,
                 topk_weights=topk_weight,
             )
+        if (
+            M == 16
+            and os.environ.get(
+                "AITER_GLM52_M16_PRIVATE_GROUPED",
+                "0",
+            )
+            == "1"
+        ):
+            from aiter.ops.flydsl.mxfp4_routed_compact_shared_moe_kernels import (
+                flydsl_mxfp4_routed_compact_shared_moe,
+            )
+
+            return flydsl_mxfp4_routed_compact_shared_moe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                topk_ids=topk_ids,
+                topk_weights=topk_weight,
+                stage1_dispatch_n_groups=4,
+                stage1_bn=256,
+                stage2_dispatch_n_groups=0,
+            )
 
         from aiter.ops.flydsl.mxfp4_sort_quant_moe_kernels import (
             flydsl_mxfp4_sort_quant_moe,
@@ -2182,12 +2206,8 @@ def get_2stage_cfgs(
         "flydsl_mxmoe_flat_g1_a4w4_"
     ):
         return MOEMetadata(
-            stage1=functools.partial(
-                _mxfp4_flat_stage1_fw, kernelName1=kernelName1
-            ),
-            stage2=functools.partial(
-                _mxfp4_flat_stage2_fw, kernelName2=kernelName2
-            ),
+            stage1=functools.partial(_mxfp4_flat_stage1_fw, kernelName1=kernelName1),
+            stage2=functools.partial(_mxfp4_flat_stage2_fw, kernelName2=kernelName2),
             block_m=16,
             ksplit=0,
             run_1stage=False,

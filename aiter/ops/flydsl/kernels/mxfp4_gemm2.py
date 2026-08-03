@@ -357,6 +357,7 @@ def _gemm2_body(
     direct_weight_col=0,
     direct_sequential_weight_one=False,
     direct_k_half=None,
+    private_route_scales=False,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -432,13 +433,34 @@ def _gemm2_body(
     def load_a_scale_tile(kt):
         out = [None] * _kSubBlocks
         for sub in range_constexpr(_kSubBlocks):
-            out[sub] = buffer_ops.buffer_load(
-                ascale_rsrc,
-                (v_voff_scale + fx.Int32(kt * 256)) // fx.Int32(4),
-                vec_width=1,
-                dtype=T.i32,
-                soffset_bytes=a_scale_s_base[sub],
-            )
+            if const_expr(private_route_scales):
+                packed_token = fx.Int32(
+                    llvm.load(
+                        T.i32,
+                        _global_ptr1(
+                            arg_stids,
+                            (m_row + fx.Int32(sub * 32) + lane_mod_16) * fx.Int32(4),
+                        ),
+                        invariant=True,
+                    )
+                )
+                private_block = packed_token.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+                private_voffset = lane_div_16 * fx.Int32(64) + fx.Int32(kt * 256)
+                out[sub] = buffer_ops.buffer_load(
+                    ascale_rsrc,
+                    private_voffset // fx.Int32(4),
+                    vec_width=1,
+                    dtype=T.i32,
+                    soffset_bytes=private_block * fx.Int32(_asc_per_mb),
+                )
+            else:
+                out[sub] = buffer_ops.buffer_load(
+                    ascale_rsrc,
+                    (v_voff_scale + fx.Int32(kt * 256)) // fx.Int32(4),
+                    vec_width=1,
+                    dtype=T.i32,
+                    soffset_bytes=a_scale_s_base[sub],
+                )
         return out
 
     def load_b_scale_tile(kt):
@@ -905,8 +927,7 @@ def _atomic_bf16_epilog(
                             _gep1(
                                 sweights_base,
                                 (
-                                    safe_row
-                                    * fx.Int32(direct_weight_stride)
+                                    safe_row * fx.Int32(direct_weight_stride)
                                     + fx.Int32(direct_weight_col)
                                 )
                                 * fx.Int32(4),
@@ -954,9 +975,7 @@ def _atomic_bf16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         if const_expr(direct_route):
             if const_expr(direct_sequential_rows):
-                token_id = (row_in_block < i32_M).select(
-                    row_in_block, i32_M
-                )
+                token_id = (row_in_block < i32_M).select(row_in_block, i32_M)
             elif const_expr(mr == 0):
                 is_live = m_lane == fx.Int32(0)
                 token_id = fx.Int32(

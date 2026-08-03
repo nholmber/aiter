@@ -211,7 +211,7 @@ The trace closes simple instruction reordering as a meaningful M=16 lever.
 Further improvement requires either W1 reuse or a compact/persistent dispatch
 that places a second useful workgroup on more CUs.
 
-### Compulsory W1 traffic roofline
+### Compulsory W1 traffic accounting
 
 The traced routing produces 101 compact BM16 expert blocks. G1 must read:
 
@@ -221,24 +221,92 @@ The traced routing produces 101 compact BM16 expert blocks. G1 must read:
 
 PMC reports 2,643,809 TCC misses. At a 128-byte line, that is 338,407,552
 bytes, only 0.25% above the compulsory W1 payload-plus-scale total. The
-54.2-us counter dispatch therefore sustains approximately 6.24 TB/s of miss
-traffic.
+54.2-us counter dispatch therefore corresponds to approximately 6.24 TB/s
+when miss events are converted with that line-size assumption.
 
-At that observed bandwidth, the FP4 payload alone requires about 50.9 us and
-the scales about 3.2 us. This accounts for essentially the complete G1
-dispatch before activation reads and output stores are considered.
+This is useful traffic accounting, but it is not a hard device roofline.
+`TCC_MISS * 128 B` establishes that the kernel issues almost no redundant
+miss-line requests relative to the logical W1 payload and scales. It does not
+establish that every event maps one-to-one to a full physical HBM transfer, or
+that the memory interfaces, partitions, and request queues are saturated at
+their attainable bandwidth. The previous wording incorrectly promoted the
+observed 6.24 TB/s into a lower bound on runtime.
 
 Consequences:
 
 - Sorting has already removed duplicate-expert W1 reads.
 - The 16x16 preshuffle uses essentially every fetched cache line.
 - Gate/up interleaving and scale-vectorization cannot reduce compulsory bytes.
-- Persistent dispatch can improve balance but cannot reduce the dominant
-  memory volume.
+- A faster implementation must improve delivery of the same bytes, reduce
+  non-W1 work, overlap stages, or change the representation.
 
-A material M=16 gain now requires changing the representation itself
-(fewer weight/scale bytes or cross-invocation reuse), not another local
-scheduling or tiling change.
+The result rules out simple byte-elimination arguments, not latency hiding,
+partition balance, finer work scheduling, or a structural fusion. A reported
+15% improvement from an independent implementation is therefore plausible
+and is evidence that the earlier "roofline" conclusion was overconfident.
+
+### Two-wave BN64 scheduling-granularity experiment
+
+To test whether the 404 useful BN256 workgroups were leaving a large
+coarse-grid tail, GEMM1 was reworked into a correct 128-thread/two-wave BN64
+variant. It kept the same logical W1 payload while increasing the useful task
+count from 404 to 1,616.
+
+The experiment did not recover the expected tail headroom:
+
+- Selected BN256 G1: approximately 51-52 us.
+- Two-wave BN64 G1: approximately 54-56 us across XCD swizzles 0, 1, 2, 4,
+  and 8.
+- The complete eager pipeline was approximately 2-5 us slower than the
+  selected BN256 path.
+
+The finer grid was outweighed by per-workgroup A/scale setup, barriers, and
+the duplicated activation/quantization epilogue. The experimental code was
+removed after correctness and timing validation.
+
+### Embedded private G1 plus grouped G2
+
+A higher-level restructuring produced a material M=16 improvement without
+reducing compulsory W1 bytes:
+
+1. Stage 1 performs embedded leader detection and grouped GEMM1.
+2. Each activated row is scattered to its original route-private FP4 block.
+3. The leader publishes token, weight, expert, count, and private-route
+   metadata.
+4. Stage 2 gathers the private FP4 payload and e8m0 scales into LDS, then runs
+   one grouped GEMM2 per unique routed expert. The deterministic shared expert
+   remains a grouped block with expert ID 256 and weight 1.
+
+This avoids the external sort launch while retaining both W1 and W2 expert
+reuse. Representative M=16 stage times are:
+
+- Embedded/private G1: approximately 51-54 us.
+- Grouped/gathering G2: approximately 25-26 us.
+
+Graph replay was correct across repeated replays and several routing seeds:
+
+| Seed | Prior selected sort+quant (us) | Private/grouped (us) | Delta |
+|---:|---:|---:|---:|
+| 1 | 88.60 | 83.09 | -6.2% |
+| 7 | 90.56 | 84.88 | -6.3% |
+| 41 | 88.57 | 83.32 | -5.9% |
+| 4 | 86.98 | 89.26 | +2.6% |
+
+The seed-4 regression is repeatable even though it has fewer unique routed
+experts. The cost is therefore sensitive to route/expert placement, not just
+the number of compulsory expert blocks. Route/N XCD1 and XCD4 permutations,
+an expert-ID candidate grid, and two Stage-1 N groups all regressed further.
+
+The implementation is wired behind:
+
+```text
+AITER_GLM52_M16_PRIVATE_GROUPED=1
+```
+
+It remains opt-in pending model-level routing traces and E2E validation. The
+important roofline conclusion is unchanged in its corrected form: G1 still
+moves essentially the minimum W1 bytes, but the complete MoE pipeline had
+substantial removable sort and duplicate-W2 work.
 
 ## Primary bottlenecks
 

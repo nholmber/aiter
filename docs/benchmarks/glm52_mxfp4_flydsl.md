@@ -1148,6 +1148,8 @@ The public GLM-5.2 specialized dispatch now selects:
 - M=3–4: deterministic shared-hybrid
 - M=5–8: fused sort+quant, cached W1, XCD=8
 - M=9–16: fused sort+quant, BN256 non-temporal W1, XCD=4
+- Exact M=16 opt-in: embedded private G1 plus grouped G2 when
+  `AITER_GLM52_M16_PRIVATE_GROUPED=1`
 
 The M=5–16 path remains guarded by `AITER_GLM52_FUSED_MOE=1` and the existing
 min/max-M environment variables.
@@ -1241,10 +1243,55 @@ approximately 1.9 us, and vectorizing four K-tile scale dwords into one
 The selected schedule is unchanged.
 
 The traced M=16 routing has 101 compact expert blocks. Its compulsory W1
-payload plus e8m0 scales total 337.58 MB, while PMC records 338.41 MB of
-128-byte TCC miss lines. The difference is only 0.25%. At the measured
-54.2-us dispatch duration this is approximately 6.24 TB/s, establishing that
-the selected G1 is already at the compulsory-weight traffic floor.
+payload plus e8m0 scales total 337.58 MB, while PMC records 338.41 MB after
+converting TCC misses with an assumed 128-byte line. The difference is only
+0.25%, and the measured 54.2-us dispatch corresponds to approximately
+6.24 TB/s by that accounting.
+
+This establishes near-minimal miss-request volume, not a hard runtime
+roofline. The counter conversion does not prove one full physical HBM line per
+event or saturation of the attainable memory interfaces. The earlier
+conclusion that another material software gain was impossible was too strong.
+
+A follow-up 128-thread/two-wave BN64 G1 increased useful scheduling units from
+404 BN256 tiles to 1,616 BN64 tiles without increasing logical W1 bytes. It was
+correct, but G1 measured approximately 54-56 us versus 51-52 us for BN256;
+duplicated setup and epilogue work outweighed the finer scheduling. The
+experimental code was removed.
+
+#### Embedded private G1 plus grouped G2
+
+The routed embedded-sort path was reworked so Stage 1 keeps its cheap
+route-private scatter but publishes a compact route map. Stage 2 reads the
+route ID from the high byte of the packed token metadata, gathers each
+route-private FP4 row and scale dword into LDS, and computes one grouped G2 per
+unique expert.
+
+This combines:
+
+- no external sort launch;
+- one W1 read per unique routed expert;
+- one W2 read per unique routed expert;
+- deterministic shared expert 256, final slot, weight 1.
+
+Typical M=16 stage timing is approximately 51-54 us G1 plus 25-26 us G2.
+Graph replay results:
+
+| Seed | Prior selected (us) | Private/grouped (us) | Delta |
+|---:|---:|---:|---:|
+| 1 | 88.60 | 83.09 | -6.2% |
+| 7 | 90.56 | 84.88 | -6.3% |
+| 41 | 88.57 | 83.32 | -5.9% |
+| 4 | 86.98 | 89.26 | +2.6% |
+
+The route-order sensitivity prevents unconditional selection. XCD route
+swizzles, an expert-ID candidate grid, two Stage-1 N groups, and inline-quant
+BN512 were all correct or diagnosable but slower. The new path is available
+for model-level A/B through:
+
+```text
+AITER_GLM52_M16_PRIVATE_GROUPED=1
+```
 
 #### Selective direct-scale pipelining
 
