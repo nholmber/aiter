@@ -1293,6 +1293,38 @@ for model-level A/B through:
 AITER_GLM52_M16_PRIVATE_GROUPED=1
 ```
 
+#### Exact production-image model A/B
+
+The August 4, 2026 model A/B used the exact production base
+`vllm_69715823_aiter_4a1cc77_glm52_production_tp4_pr1_pr2_pr3_pr4_pr50008`
+and an isolated six-layer candidate overlay.
+
+At concurrency 16, candidate output-token throughput changed by:
+
+- 1024 / 1024: -1.94%.
+- 8192 / 1024: -1.70%.
+- 60000 / 600: +0.29%.
+
+Matched pure-decode traces explain the short/medium-context regression. Per
+MoE layer:
+
+- Baseline G1 / G2 / adaptive auxiliary: 54.982 / 28.759 / 4.348 us.
+- Private G1 / grouped G2: 61.831 / 29.785 us.
+- Net private-path regression: 3.526 us/layer, or 264.4 us across 75 layers.
+
+The robust scheduler-step p10/median/p90 regress by 349/392/429 us. The real
+GLM route distribution therefore behaves like the unfavorable synthetic route
+seeds: the fixed route-candidate grid gets less expert reuse, while retaining
+leader detection and route-private metadata overhead.
+
+The private path stays opt-in and disabled in production. With current G2,
+private G1 must improve from 61.831 us to at most 58.305 us on real routes to
+reach MoE break-even.
+
+Full results and trace reproduction:
+
+`docs/benchmarks/glm52_m16_private_grouped_ab_20260804.md`
+
 #### Selective direct-scale pipelining
 
 The initial direct-scale implementation gathered all 24 K-tile scale operands
@@ -1367,5 +1399,6 @@ dispatchable production win.
 - XCD changes are sub-microsecond, but graph sweeps consistently favored XCD8
   for the cached M<=8 bucket and XCD4 near the top of the M=16 bucket.
 
-This establishes a small but repeatable production-relevant win without
-returning to a one-stage G1+G2 kernel.
+The sorted quant-once work remains the route-stable direction. The
+route-private/grouped M=16 experiment is not a production win on real GLM
+routing and remains opt-in only.

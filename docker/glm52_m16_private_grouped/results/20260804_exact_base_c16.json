@@ -1,0 +1,173 @@
+{
+  "date": "2026-08-04",
+  "shape": {
+    "model": "amd/GLM-5.2-MXFP4",
+    "tensor_parallel_size": 4,
+    "concurrency": 16,
+    "hidden": 6144,
+    "intermediate": 512,
+    "experts": 257,
+    "topk": 9,
+    "shared_expert": 256,
+    "shared_weight": 1.0
+  },
+  "images": {
+    "baseline": "amdsiloai/vllm-private:vllm_69715823_aiter_4a1cc77_glm52_production_tp4_pr1_pr2_pr3_pr4_pr50008",
+    "candidate": "amdsiloai/vllm-private:vllm_69715823_aiter_4bec01e6a_glm52_m16_private_grouped_pr1_pr2_pr3_pr4_pr50008",
+    "candidate_id": "sha256:e152f4b03e0d24130d7241c598ba2bbe427c379d8806c98b54fa5ede24172858",
+    "candidate_base_is_exact_prefix": true
+  },
+  "serving": [
+    {
+      "input_tokens": 1024,
+      "output_tokens": 1024,
+      "seed": 9,
+      "num_prompts": 96,
+      "baseline": {
+        "duration_s": 104.23,
+        "output_tokens_per_s": 840.22,
+        "mean_e2e_ms": 16903.75,
+        "mean_ttft_ms": 319.35,
+        "mean_tpot_ms": 18.15,
+        "mean_itl_ms": 18.20
+      },
+      "candidate": {
+        "duration_s": 106.29,
+        "output_tokens_per_s": 823.92,
+        "mean_e2e_ms": 17243.90,
+        "mean_ttft_ms": 305.06,
+        "mean_tpot_ms": 18.54,
+        "mean_itl_ms": 18.60
+      },
+      "candidate_delta_percent": {
+        "output_tokens_per_s": -1.940,
+        "duration_s": 1.976,
+        "mean_e2e_ms": 2.012,
+        "mean_ttft_ms": -4.475,
+        "mean_tpot_ms": 2.149,
+        "mean_itl_ms": 2.198
+      }
+    },
+    {
+      "input_tokens": 8192,
+      "output_tokens": 1024,
+      "seed": 11,
+      "num_prompts": 96,
+      "baseline": {
+        "duration_s": 118.51,
+        "output_tokens_per_s": 753.57,
+        "mean_e2e_ms": 19390.86,
+        "mean_ttft_ms": 776.03,
+        "mean_tpot_ms": 19.99,
+        "mean_itl_ms": 20.20
+      },
+      "candidate": {
+        "duration_s": 120.56,
+        "output_tokens_per_s": 740.75,
+        "mean_e2e_ms": 19721.46,
+        "mean_ttft_ms": 768.38,
+        "mean_tpot_ms": 20.35,
+        "mean_itl_ms": 20.54
+      },
+      "candidate_delta_percent": {
+        "output_tokens_per_s": -1.701,
+        "duration_s": 1.730,
+        "mean_e2e_ms": 1.705,
+        "mean_ttft_ms": -0.986,
+        "mean_tpot_ms": 1.801,
+        "mean_itl_ms": 1.683
+      }
+    },
+    {
+      "input_tokens": 60000,
+      "output_tokens": 600,
+      "seed": 31,
+      "num_prompts": 96,
+      "baseline": {
+        "duration_s": 292.95,
+        "output_tokens_per_s": 175.07,
+        "mean_e2e_ms": 48576.43,
+        "mean_ttft_ms": 6691.45,
+        "mean_tpot_ms": 77.87,
+        "mean_itl_ms": 78.95
+      },
+      "candidate": {
+        "duration_s": 292.09,
+        "output_tokens_per_s": 175.58,
+        "mean_e2e_ms": 48431.83,
+        "mean_ttft_ms": 6841.95,
+        "mean_tpot_ms": 77.36,
+        "mean_itl_ms": 78.37
+      },
+      "candidate_delta_percent": {
+        "output_tokens_per_s": 0.291,
+        "duration_s": -0.294,
+        "mean_e2e_ms": -0.298,
+        "mean_ttft_ms": 2.249,
+        "mean_tpot_ms": -0.655,
+        "mean_itl_ms": -0.735
+      }
+    }
+  ],
+  "decode_profile": {
+    "trace_workload": {
+      "input_tokens": 1024,
+      "output_tokens": 1024,
+      "seed": 9,
+      "num_prompts": 32
+    },
+    "pure_decode_group": {
+      "prefill": 0,
+      "decode": 16
+    },
+    "baseline_steps_per_rank": 1666,
+    "candidate_steps_per_rank": 1664,
+    "wall_us": {
+      "baseline": {
+        "p10": 15525.687,
+        "median": 15698.513,
+        "p90": 15856.546
+      },
+      "candidate": {
+        "p10": 15874.706,
+        "median": 16090.780,
+        "p90": 16285.344
+      },
+      "candidate_delta": {
+        "p10_us": 349.018,
+        "median_us": 392.267,
+        "p90_us": 428.799,
+        "p10_percent": 2.248,
+        "median_percent": 2.499,
+        "p90_percent": 2.704
+      }
+    },
+    "moe_us_per_layer": {
+      "baseline": {
+        "g1": 54.982,
+        "g2": 28.759,
+        "adaptive_aux": 4.348,
+        "total": 88.090
+      },
+      "candidate": {
+        "g1": 61.831,
+        "g2": 29.785,
+        "adaptive_aux": 0.0,
+        "total": 91.616
+      },
+      "candidate_delta": {
+        "g1": 6.849,
+        "g2": 1.025,
+        "adaptive_aux": -4.348,
+        "total": 3.526,
+        "total_percent": 4.002,
+        "per_decode_step_us": 264.427
+      }
+    },
+    "candidate_kernel_names": [
+      "mxfp4_routed_compact_shared_g1_h6144_i512_ne257_tk9_bm16_rnt_scached_sep_ng4_private_v2",
+      "mxfp4_routed_compact_shared_g2_h6144_i512_ne257_tk9_bm16_rcached_scached_ng24_private_v2"
+    ]
+  },
+  "conclusion": "Keep AITER_GLM52_M16_PRIVATE_GROUPED opt-in. Real GLM routing reverses the synthetic graph win at M=16."
+}
