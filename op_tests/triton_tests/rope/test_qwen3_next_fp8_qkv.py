@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import aiter
+from aiter import flash_attn_varlen_func
 from aiter.ops.triton.rope.qwen3_next_fp8_qkv import (
     FP8_MAX,
     qwen3_next_fp8_qkv_prep,
@@ -315,3 +316,51 @@ def test_qwen3_next_fp8_qkv_prep_rejects_cpu_inputs():
 
 def test_qwen3_next_fp8_qkv_output_dtype():
     assert aiter.dtypes.fp8 in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def test_qwen3_next_fp8_qkv_fmha_abi():
+    lengths = [128]
+    inputs = _make_inputs(lengths)
+    output = qwen3_next_fp8_qkv_prep(
+        *inputs,
+        num_actual_tokens=128,
+        num_query_heads=NUM_QUERY_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        rotary_dim=ROTARY_DIM,
+        eps=EPS,
+    )
+    cu_seqlens = inputs[-1]
+    attention_kwargs = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        min_seqlen_q=1,
+        dropout_p=0.0,
+        softmax_scale=HEAD_DIM**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+    )
+    reference = flash_attn_varlen_func(
+        output.query.view(128, NUM_QUERY_HEADS, HEAD_DIM),
+        output.key.view(128, NUM_KV_HEADS, HEAD_DIM),
+        inputs[2].view(128, NUM_KV_HEADS, HEAD_DIM),
+        **attention_kwargs,
+    )
+    actual = flash_attn_varlen_func(
+        output.query_fp8,
+        output.key_fp8,
+        output.value_fp8,
+        q_descale=output.query_descale[:1],
+        k_descale=output.key_descale[:1],
+        v_descale=output.value_descale[:1],
+        **attention_kwargs,
+    )
+    torch.cuda.synchronize()
+
+    relative_error = (
+        actual.float() - reference.float()
+    ).abs().amax() / reference.float().abs().amax()
+    assert relative_error < 0.08
+    assert torch.isfinite(actual).all()
