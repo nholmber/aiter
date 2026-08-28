@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from aiter.ops.triton.gated_delta_net import fused_rearrange_sigmoid_gated_delta_rule
 
@@ -76,6 +77,20 @@ def ref_fused_rearrange_sigmoid_gdr(
             o[0, t, hv] = out_vec
             h_state[hv] = h_sub
     return o, h_state.unsqueeze(0)
+
+
+def rmsnorm_silu_reference(
+    x: torch.Tensor,
+    output_gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Match RMSNormGated(norm_before_gate=True, activation="silu")."""
+    x_float = x.float()
+    inv_rms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
+    return (x_float * inv_rms * weight.float() * F.silu(output_gate.float())).to(
+        x.dtype
+    )
 
 
 # Shapes aligned with ``test_gated_delta_rule.test_fused_recurrent``; dtypes are
@@ -213,3 +228,111 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
         assert torch.isfinite(h_tr.float()).all(), "non-finite Triton final_state"
     torch.testing.assert_close(o_tr.float(), o_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=rtol, atol=atol)
+
+
+@cuda_ok
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32])
+def test_fused_gdr_rmsnorm_silu_qwen_tp8_indexed_decode(
+    num_tokens: int,
+) -> None:
+    """Fused Qwen path matches current GDR followed by RMSNormGated."""
+    torch.manual_seed(17)
+    device = "cuda"
+    dtype = torch.bfloat16
+    H, HV, K, V = 2, 16, 128, 128
+    key_dim = H * K
+    value_dim = HV * V
+    scale = K**-0.5
+    norm_eps = 1e-6
+
+    qkv = (
+        torch.randn(
+            num_tokens,
+            2 * key_dim + value_dim,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.05
+    )
+    A_log = torch.randn(HV, device=device, dtype=torch.float32).clamp(-2.0, 0.5) * 0.02
+    a = (torch.randn(num_tokens, HV, device=device, dtype=dtype) * 0.05).clamp(
+        -1.0, 1.0
+    )
+    b_gate = (torch.randn(num_tokens, HV, device=device, dtype=dtype) * 0.05).clamp(
+        -1.0, 1.0
+    )
+    dt_bias = (torch.randn(HV, device=device, dtype=dtype) * 0.005).clamp(-0.5, 0.5)
+    output_gate = torch.randn(num_tokens, HV, V, device=device, dtype=dtype)
+    norm_weight = torch.randn(V, device=device, dtype=dtype)
+
+    state_pool_size = num_tokens + 7
+    initial_state = (
+        torch.randn(
+            state_pool_size,
+            HV,
+            V,
+            K,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.05
+    )
+    state_indices = torch.randperm(state_pool_size, device=device, dtype=torch.int64)[
+        :num_tokens
+    ].to(torch.int32)
+    cu_seqlens = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
+
+    reference_state = initial_state.clone()
+    raw_output, _ = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log=A_log,
+        a=a,
+        b=b_gate,
+        dt_bias=dt_bias,
+        qkv=qkv,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        head_k_dim=K,
+        head_v_dim=V,
+        scale=scale,
+        initial_state=reference_state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+    expected = rmsnorm_silu_reference(
+        raw_output.view(num_tokens, HV, V),
+        output_gate,
+        norm_weight,
+        norm_eps,
+    )
+
+    fused_state = initial_state.clone()
+    fused_output, _ = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log=A_log,
+        a=a,
+        b=b_gate,
+        dt_bias=dt_bias,
+        qkv=qkv,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        head_k_dim=K,
+        head_v_dim=V,
+        scale=scale,
+        initial_state=fused_state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    torch.testing.assert_close(
+        fused_output.view(num_tokens, HV, V),
+        expected,
+        rtol=3e-2,
+        atol=5e-2,
+    )
+    torch.testing.assert_close(fused_state, reference_state, rtol=3e-2, atol=5e-2)

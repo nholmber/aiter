@@ -163,3 +163,130 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         p_o += HV * V
         p_b += HV
         p_a += HV
+
+
+@triton.jit
+def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
+    A_log,
+    a,
+    b,
+    dt_bias,
+    beta,
+    threshold,
+    qkv,
+    output_gate,
+    norm_weight,
+    o,
+    h0,
+    cu_seqlens,
+    ssm_state_indices,
+    scale,
+    norm_eps,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    stride_qkv_l: tl.constexpr,
+    stride_qkv_hd: tl.constexpr,
+    stride_gate_l: tl.constexpr,
+    stride_gate_h: tl.constexpr,
+    stride_gate_v: tl.constexpr,
+    stride_init_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    stride_norm_weight: tl.constexpr,
+):
+    """Qwen TP8 decode GDR update with fused RMSNorm and SiLU gating.
+
+    One program owns a complete ``(sequence, value-head)`` output vector.  The
+    recurrent state is still processed in four BV=32 tiles so the live state
+    footprint matches the existing kernel, but the program accumulates the
+    full-V sum of squares before applying RMSNorm.  ``o`` is used as a BF16
+    scratch buffer between the recurrent pass and the normalization pass; this
+    deliberately matches the existing GDR -> RMSNormGated precision boundary.
+    """
+    i_nh = tl.program_id(0)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    if eos - bos != 1:
+        return
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    if state_idx < 0:
+        return
+
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+
+    p_q = qkv + bos * stride_qkv_l + (i_h * K + o_k) * stride_qkv_hd
+    p_k = qkv + bos * stride_qkv_l + (H * K + i_h * K + o_k) * stride_qkv_hd
+    b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+    b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+    b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q = b_q * scale
+
+    x = tl.load(a + bos * HV + i_hv).to(tl.float32) + tl.load(dt_bias + i_hv).to(
+        tl.float32
+    )
+    softplus_x = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    b_g = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
+    b_beta = tl.sigmoid(tl.load(b + bos * HV + i_hv).to(tl.float32))
+    b_decay = tl.exp(b_g)
+
+    p_h0_base = h0 + state_idx * stride_init_state_token + i_hv * V * K
+    p_v_base = qkv + bos * stride_qkv_l + (2 * H * K + i_hv * V) * stride_qkv_hd
+    p_o_base = o + (bos * HV + i_hv) * V
+
+    sum_sq = 0.0
+    for v_start in tl.static_range(0, V, BV):
+        o_v = v_start + tl.arange(0, BV)
+        mask_v = o_v < V
+        mask_h = mask_v[:, None] & mask_k[None, :]
+
+        p_h = p_h0_base + o_v[:, None] * K + o_k[None, :]
+        b_h = tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
+        b_v = tl.load(p_v_base + o_v * stride_qkv_hd, mask=mask_v, other=0).to(
+            tl.float32
+        )
+
+        b_h *= b_decay
+        b_v -= tl.sum(b_h * b_k[None, :], axis=1)
+        b_v *= b_beta
+        b_h += b_v[:, None] * b_k[None, :]
+        b_o = tl.sum(b_h * b_q[None, :], axis=1)
+
+        p_o = p_o_base + o_v
+        b_o_storage = b_o.to(p_o.dtype.element_ty)
+        tl.store(p_o, b_o_storage, mask=mask_v)
+        tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+
+        b_o_rounded = b_o_storage.to(tl.float32)
+        sum_sq += tl.sum(b_o_rounded * b_o_rounded, axis=0)
+
+    # Keep the scratch stores ordered before the full-width reload below.
+    tl.debug_barrier()
+
+    o_v = tl.arange(0, V)
+    mask_v = o_v < V
+    p_o = p_o_base + o_v
+    b_o = tl.load(p_o, mask=mask_v, other=0).to(tl.float32)
+    b_weight = tl.load(norm_weight + o_v * stride_norm_weight, mask=mask_v, other=0).to(
+        tl.float32
+    )
+    b_z = tl.load(
+        output_gate + bos * stride_gate_l + i_hv * stride_gate_h + o_v * stride_gate_v,
+        mask=mask_v,
+        other=0,
+    ).to(tl.float32)
+
+    inv_rms = tl.rsqrt(sum_sq / V + norm_eps)
+    b_silu = b_z * tl.sigmoid(b_z)
+    b_out = b_o * inv_rms * b_weight * b_silu
+    tl.store(p_o, b_out.to(p_o.dtype.element_ty), mask=mask_v)
