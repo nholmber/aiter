@@ -187,7 +187,6 @@ def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
-    BV: tl.constexpr,
     stride_qkv_l: tl.constexpr,
     stride_qkv_hd: tl.constexpr,
     stride_gate_l: tl.constexpr,
@@ -199,12 +198,10 @@ def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
 ):
     """Qwen TP8 decode GDR update with fused RMSNorm and SiLU gating.
 
-    One program owns a complete ``(sequence, value-head)`` output vector.  The
-    recurrent state is still processed in four BV=32 tiles so the live state
-    footprint matches the existing kernel, but the program accumulates the
-    full-V sum of squares before applying RMSNorm.  ``o`` is used as a BF16
-    scratch buffer between the recurrent pass and the normalization pass; this
-    deliberately matches the existing GDR -> RMSNormGated precision boundary.
+    One 16-wave program owns the full ``(sequence, value-head)`` state update,
+    restoring parallelism across all V=128 rows. The BF16-rounded recurrent
+    output stays in registers for the full-V RMS reduction and final SiLU-gated
+    store, avoiding the safe prototype's temporary output write and reload.
     """
     i_nh = tl.program_id(0)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -220,7 +217,10 @@ def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
         return
 
     o_k = tl.arange(0, BK)
+    o_v = tl.arange(0, V)
     mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_v[:, None] & mask_k[None, :]
 
     p_q = qkv + bos * stride_qkv_l + (i_h * K + o_k) * stride_qkv_hd
     p_k = qkv + bos * stride_qkv_l + (H * K + i_h * K + o_k) * stride_qkv_hd
@@ -240,43 +240,29 @@ def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
     b_beta = tl.sigmoid(tl.load(b + bos * HV + i_hv).to(tl.float32))
     b_decay = tl.exp(b_g)
 
-    p_h0_base = h0 + state_idx * stride_init_state_token + i_hv * V * K
-    p_v_base = qkv + bos * stride_qkv_l + (2 * H * K + i_hv * V) * stride_qkv_hd
-    p_o_base = o + (bos * HV + i_hv) * V
+    p_h = (
+        h0
+        + state_idx * stride_init_state_token
+        + i_hv * V * K
+        + o_v[:, None] * K
+        + o_k[None, :]
+    )
+    b_h = tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
+    b_v = tl.load(
+        qkv + bos * stride_qkv_l + (2 * H * K + i_hv * V + o_v) * stride_qkv_hd,
+        mask=mask_v,
+        other=0,
+    ).to(tl.float32)
 
-    sum_sq = 0.0
-    for v_start in tl.static_range(0, V, BV):
-        o_v = v_start + tl.arange(0, BV)
-        mask_v = o_v < V
-        mask_h = mask_v[:, None] & mask_k[None, :]
+    b_h *= b_decay
+    b_v -= tl.sum(b_h * b_k[None, :], axis=1)
+    b_v *= b_beta
+    b_h += b_v[:, None] * b_k[None, :]
+    b_o = tl.sum(b_h * b_q[None, :], axis=1).to(tl.bfloat16)
+    tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
 
-        p_h = p_h0_base + o_v[:, None] * K + o_k[None, :]
-        b_h = tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
-        b_v = tl.load(p_v_base + o_v * stride_qkv_hd, mask=mask_v, other=0).to(
-            tl.float32
-        )
-
-        b_h *= b_decay
-        b_v -= tl.sum(b_h * b_k[None, :], axis=1)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], axis=1)
-
-        p_o = p_o_base + o_v
-        b_o_storage = b_o.to(p_o.dtype.element_ty)
-        tl.store(p_o, b_o_storage, mask=mask_v)
-        tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
-
-        b_o_rounded = b_o_storage.to(tl.float32)
-        sum_sq += tl.sum(b_o_rounded * b_o_rounded, axis=0)
-
-    # Keep the scratch stores ordered before the full-width reload below.
-    tl.debug_barrier()
-
-    o_v = tl.arange(0, V)
-    mask_v = o_v < V
-    p_o = p_o_base + o_v
-    b_o = tl.load(p_o, mask=mask_v, other=0).to(tl.float32)
+    b_o_float = b_o.to(tl.float32)
+    p_o = o + (bos * HV + i_hv) * V + o_v
     b_weight = tl.load(norm_weight + o_v * stride_norm_weight, mask=mask_v, other=0).to(
         tl.float32
     )
@@ -286,7 +272,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_rmsnorm_silu_update_kernel(
         other=0,
     ).to(tl.float32)
 
-    inv_rms = tl.rsqrt(sum_sq / V + norm_eps)
+    inv_rms = tl.rsqrt(tl.sum(b_o_float * b_o_float, axis=0) / V + norm_eps)
     b_silu = b_z * tl.sigmoid(b_z)
-    b_out = b_o * inv_rms * b_weight * b_silu
+    b_out = b_o_float * inv_rms * b_weight * b_silu
     tl.store(p_o, b_out.to(p_o.dtype.element_ty), mask=mask_v)

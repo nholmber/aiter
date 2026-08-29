@@ -196,7 +196,6 @@ def fused_rearrange_sigmoid_gated_delta_rule(
             K=K,
             V=V,
             BK=BK,
-            BV=BV,
             stride_qkv_l=stride_qkv_l,
             stride_qkv_hd=stride_qkv_hd,
             stride_gate_l=stride_gate_l,
@@ -205,7 +204,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
             stride_init_state_token=stride_init_state_token,
             stride_indices_seq=stride_indices_seq,
             stride_norm_weight=norm_weight.stride(0),
-            num_warps=num_warps,
+            num_warps=16,
             num_stages=num_stages,
         )
         return o.squeeze(0), final_state
