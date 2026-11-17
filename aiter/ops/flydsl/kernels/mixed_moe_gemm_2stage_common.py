@@ -3357,6 +3357,10 @@ def compile_mixed_moe_gemm2_common(
 
             w_rsrc = ptr_rsrc(arg_w, w_nbytes)
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
+            w2_addr_i64 = fx.Int64(fx.ptrtoint(arg_w))
+            per_expert_w2_bytes = w_nbytes // experts
+            # load_cell indexes bytes for 1-byte B elements, else elements of b_elem_bytes
+            w2_idx_bytes = 1 if int(b_elem_bytes) == 1 else int(b_elem_bytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
             # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
@@ -3718,17 +3722,23 @@ def compile_mixed_moe_gemm2_common(
                         )
                         return s0, s1, s2, s3
 
+                    # per-expert 64-bit re-base (as stage 1 does for w1): one descriptor over
+                    # all of w2 wraps its 32-bit voffset for experts past 4 GiB
+                    w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
+                        (w2_addr_i64 + fx.Int64(expert_b_base) * fx.Int64(w2_idx_bytes)).ir_value(),
+                        num_records_bytes=per_expert_w2_bytes,
+                    )
                     b0, b1 = load_cell(
-                        w_rsrc,
-                        expert_b_base,
+                        w_rsrc_e,
+                        fx.Index(0),
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
-                            expert_b_base,
+                            w_rsrc_e,
+                            fx.Index(0),
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + 1,
