@@ -5746,6 +5746,15 @@ def get_2stage_cfgs(
             _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        if model_dim % 256 != 0:
+            # The fp8/fp4 stage-1 kernels tile K = model_dim by 256 (fp8 packs two K=128
+            # MFMA steps) and have no K tail: a 128-but-not-256-aligned hidden size read
+            # past each row and returned garbage. Pad the weights instead.
+            raise ValueError(
+                f"FlyDSL per_1x32 MoE stage 1 needs model_dim % 256 == 0, got {model_dim}: "
+                "zero-pad hidden_states, w1 and w2 along hidden to a multiple of 256, pass "
+                "hidden_pad=<padded columns> and slice the padded output back"
+            )
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
